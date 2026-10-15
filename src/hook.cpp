@@ -779,23 +779,32 @@ namespace
 	//   can change it - the two DateTime fields have to be rewritten in
 	//   memory, exactly like the costume isUnlocked_ flag was.
 	//
+	//   v10 hooked set_BeginDate / set_EndDate and WROTE the new dates back into
+	//   the master rows.  That crashed the game before the title screen with
+	//   ErrorCode[E6A359E6] and produced a 17 MB mst-events.txt full of garbage,
+	//   i.e. either the resolved method or its calling convention was wrong, so
+	//   the writes landed on unrelated objects.
+	//
+	//   v11 is therefore strictly READ-ONLY: it hooks the *getter* get_EndDate
+	//   and replaces its RETURN VALUE.  Nothing is ever written to memory, and
+	//   the override only happens when the returned value is unmistakably a
+	//   DateTime in ticks (2000..2100).  If this build ever returns something
+	//   else (e.g. a pointer to the struct), the original value is handed back
+	//   untouched - a wrong guess can therefore only fail to have an effect, it
+	//   cannot corrupt anything.
+	//
 	//   System.DateTime is one ulong of 100 ns ticks since 0001-01-01:
 	//       ticks = (unixSeconds + 62135596800) * 10000000
-	//   2000-01-01 -> 630822816000000000   (moved back  = "has started")
-	//   2038-01-19 -> 642830804470000000   (moved ahead = "never ends")
+	//   2000-01-01 -> 630822816000000000
+	//   2038-01-19 -> 642830804470000000   (the value handed back = "never ends")
 	//
-	//   set_BeginDate / set_EndDate fire once per row while the master is
-	//   deserialized, so hooking the setters catches every event exactly
-	//   once without walking the table.  mst-events.txt always records the
-	//   real dates, so the data is verifiable even with the patch switched
-	//   off (scsp-config.json: "extendEventDates").
+	//   mst-events.txt always records the real values, so the data is verifiable
+	//   even with the patch switched off (scsp-config.json "extendEventDates").
 	// =====================================================================
-	HOOK_ORIG_TYPE MstEvent_set_BeginDate_orig;
-	HOOK_ORIG_TYPE MstEvent_set_EndDate_orig;
-	// forward declarations: HOOK_CAST_CALL expands to decltype(<name>_hook) in the
-	// MinHook build, so the hook functions must be visible where Apply() calls them.
-	void MstEvent_set_BeginDate_hook(void* self, uint64_t value);
-	void MstEvent_set_EndDate_hook(void* self, uint64_t value);
+	HOOK_ORIG_TYPE MstEvent_get_EndDate_orig;
+	// forward declaration: HOOK_CAST_CALL expands to decltype(<name>_hook) in the
+	// MinHook build, so the hook function must be visible where it is referenced.
+	uint64_t MstEvent_get_EndDate_hook(void* self);
 
 	namespace EventDates {
 		constexpr uint64_t PAST_TICKS   = 630822816000000000ULL;  // 2000-01-01
@@ -832,15 +841,19 @@ namespace
 			return reinterpret_cast<int (*)(void*)>(m->methodPointer)(row);
 		}
 
+		// Log the real value, but only inspect the object when the returned value
+		// already looks like DateTime ticks - that proves the target and the
+		// calling convention are the ones we think they are, so calling get_Id /
+		// get_EventType / get_BeginDate on it is safe.
 		void Report(void* row, const char* tag, uint64_t endSeen) {
+			if (endSeen < 630822816000000000ULL || endSeen > 662687040000000000ULL) return;
 			const int id = Int(row, "get_Id");
-			if (id <= 0) return;
 			{
 				std::lock_guard<std::mutex> lk(Mtx());
-				if (!Seen().insert(std::string(tag) + "#" + std::to_string(id)).second) return;
+				if (!Seen().insert(std::string(tag) + "#" + std::to_string(id) + "#" + std::to_string(endSeen)).second) return;
 			}
 			char buf[220];
-			snprintf(buf, sizeof(buf), "%-8s id=%-6d type=%-3d begin=%llu end=%llu  (real)",
+			snprintf(buf, sizeof(buf), "%-8s id=%-6d type=%-6d begin=%llu end=%llu  (real)",
 				tag, id, Int(row, "get_EventType"),
 				(unsigned long long)Int(row, "get_BeginDate"),
 				(unsigned long long)endSeen);
@@ -870,37 +883,22 @@ namespace
 			return on;
 		}
 
-		void Apply(void* row, const char* tag) {
-			if (!Enabled() || inApply) return;
-			const int id = Int(row, "get_Id");
-			if (id <= 0) return;
-			{
-				std::lock_guard<std::mutex> lk(Mtx());
-				if (!Done().insert(id).second) return;
-			}
-			inApply = true;
-			HOOK_CAST_CALL(void, MstEvent_set_BeginDate)(row, PAST_TICKS);
-			HOOK_CAST_CALL(void, MstEvent_set_EndDate)(row, FUTURE_TICKS);
-			inApply = false;
-			char buf[220];
-			snprintf(buf, sizeof(buf), "%-8s id=%-6d begin=%llu end=%llu  (extended, from %s)",
-				"PATCHED", id,
-				(unsigned long long)PAST_TICKS, (unsigned long long)FUTURE_TICKS, tag);
-			Write(buf);
+		// Read-only decision helper.  Never writes memory: it only decides which
+		// value the getter hands back, and only for values that are clearly
+		// DateTime ticks (2000..2100) - see the v11 note above.
+		uint64_t Override(uint64_t real) {
+			if (real < 630822816000000000ULL || real > 662687040000000000ULL) return real;
+			if (!Enabled()) return real;
+			return FUTURE_TICKS;
 		}
 	}
 
-	// trampolines are declared above (before EventDates) so Apply() can call them
-	void MstEvent_set_BeginDate_hook(void* self, uint64_t value) {
-		HOOK_CAST_CALL(void, MstEvent_set_BeginDate)(self, value);
-		EventDates::Report(self, "begin", 0);
-		EventDates::Apply(self, "set_BeginDate");
-	}
-
-	void MstEvent_set_EndDate_hook(void* self, uint64_t value) {
-		HOOK_CAST_CALL(void, MstEvent_set_EndDate)(self, value);
-		EventDates::Report(self, "end", value);
-		EventDates::Apply(self, "set_EndDate");
+	// READ-ONLY hook: log the real value once per distinct value, then hand back a
+	// far future date when the patch is enabled (return-value replacement only).
+	uint64_t MstEvent_get_EndDate_hook(void* self) {
+		const uint64_t real = HOOK_CAST_CALL(uint64_t, MstEvent_get_EndDate)(self);
+		EventDates::Report(self, "end", real);
+		return EventDates::Override(real);
 	}
 
 	HOOK_ORIG_TYPE DioramaProductViewModel_IsLocked_orig;
@@ -4540,11 +4538,11 @@ namespace
 		ADD_HOOK_ADDR(PRISM.Definitions.dll, PRISM.Definitions, MstProduceIdol, set_Id, 1);
 		ADD_HOOK_ADDR(PRISM.Definitions.dll, PRISM.Definitions, MstProduceIdol, set_MstIdolId, 1);
 
-		// permanent limited-time events: rewrite MstEvent.BeginDate / EndDate
-		// (see the EventDates block above).  mst-events.txt records the real
-		// dates; "extendEventDates" in scsp-config.json turns the patch on.
-		ADD_HOOK_ADDR(PRISM.Definitions.dll, PRISM.Definitions, MstEvent, set_BeginDate, 1);
-		ADD_HOOK_ADDR(PRISM.Definitions.dll, PRISM.Definitions, MstEvent, set_EndDate, 1);
+		// permanent limited-time events: replace the value returned by
+		// MstEvent.get_EndDate (READ-ONLY - see the EventDates note above).
+		// mst-events.txt records the real dates; "extendEventDates" in
+		// scsp-config.json turns the override on.
+		ADD_HOOK_ADDR(PRISM.Definitions.dll, PRISM.Definitions, MstEvent, get_EndDate, 0);
 
 		tools::AddNetworkingHooks();
 
