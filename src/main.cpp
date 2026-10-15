@@ -39,8 +39,8 @@ bool g_block_out_of_focus = false;
 float g_free_camera_mouse_speed = 35;
 bool g_allow_use_tryon_costume = false;
 bool g_allow_same_idol = false;
-bool g_unlock_all_dress = false;
-bool g_unlock_all_headwear = false;
+bool g_unlock_all_dress = false;     // save-audit diagnostic build: preserve save state
+bool g_unlock_all_headwear = false;  // save-audit diagnostic build: preserve save state
 bool g_show_hidden_costumes = false;
 bool g_save_and_replace_costume_changes = false;
 bool g_overrie_mv_unit_idols = false;
@@ -50,6 +50,9 @@ bool g_override_isVocalSeparatedOn = false;
 bool g_enable_chara_param_edit = false;
 bool g_unlock_PIdol_and_SChara_events = false;
 bool g_unlock_photo_studio = false;
+// v10: rewrite MstEvent.BeginDate/EndDate in the client master so limited-time
+// events (Shiny Runway) are permanently open.  mst-events.txt is written either way.
+bool g_extend_event_dates = false;
 int g_start_resolution_w = -1;
 int g_start_resolution_h = -1;
 bool g_start_resolution_fullScreen = false;
@@ -260,6 +263,9 @@ namespace
 			}
 			if (document.HasMember("unlockPhotoStudio")) {
 				g_unlock_photo_studio = document["unlockPhotoStudio"].GetBool();
+			}
+			if (document.HasMember("extendEventDates")) {
+				g_extend_event_dates = document["extendEventDates"].GetBool();
 			}
 
 			if (document.HasMember("startResolution")) {
