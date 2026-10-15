@@ -2,6 +2,8 @@
 #include <unordered_set>
 #include <ranges>
 #include <set>
+#include <mutex>
+#include <cstdint>
 #include <Psapi.h>
 #include <intsafe.h>
 #include "scgui/scGUIData.hpp"
@@ -768,6 +770,110 @@ namespace
 	}
 
 	// photo studio unlocking
+	// =====================================================================
+	// [PATCH] v10 - permanent limited-time EVENTS (Shiny Runway and friends)
+	//
+	//   The client decides "this event is over" from its own master table
+	//   PRISM.Definitions.MstEvent { Id, EventType, BeginDate, EndDate, ... }.
+	//   That table is inside the encrypted master, so no offline-server reply
+	//   can change it - the two DateTime fields have to be rewritten in
+	//   memory, exactly like the costume isUnlocked_ flag was.
+	//
+	//   System.DateTime is one ulong of 100 ns ticks since 0001-01-01:
+	//       ticks = (unixSeconds + 62135596800) * 10000000
+	//   2000-01-01 -> 630822816000000000   (moved back  = "has started")
+	//   2038-01-19 -> 642830804470000000   (moved ahead = "never ends")
+	//
+	//   set_BeginDate / set_EndDate fire once per row while the master is
+	//   deserialized, so hooking the setters catches every event exactly
+	//   once without walking the table.  mst-events.txt always records the
+	//   real dates, so the data is verifiable even with the patch switched
+	//   off (scsp-config.json: "extendEventDates").
+	// =====================================================================
+	namespace EventDates {
+		constexpr uint64_t PAST_TICKS   = 630822816000000000ULL;  // 2000-01-01
+		constexpr uint64_t FUTURE_TICKS = 642830804470000000ULL;  // 2038-01-19
+
+		std::mutex& Mtx() { static std::mutex m; return m; }
+		std::set<std::string>& Seen() { static std::set<std::string> s; return s; }
+		std::set<int>& Done() { static std::set<int> s; return s; }
+		thread_local bool inApply = false;
+
+		void Write(const std::string& line) {
+			std::lock_guard<std::mutex> lk(Mtx());
+			std::ofstream f("mst-events.txt", std::ios::app);
+			if (!f.is_open()) return;
+			f << line << "\n";
+			f.flush();
+		}
+
+		MethodInfo* Method(const char* name, int argc) {
+			static std::map<std::string, MethodInfo*> cache;
+			const std::string key = std::string(name) + "#" + std::to_string(argc);
+			auto it = cache.find(key);
+			if (it != cache.end()) return it->second;
+			static auto klass = il2cpp_symbols_logged::get_class(
+				"PRISM.Definitions.dll", "PRISM.Definitions", "MstEvent");
+			MethodInfo* m = klass ? il2cpp_symbols_logged::get_method(klass, name, argc) : nullptr;
+			cache[key] = m;
+			return m;
+		}
+
+		int Int(void* row, const char* getter) {
+			auto m = Method(getter, 0);
+			if (!m || m->methodPointer == nullptr) return 0;
+			return reinterpret_cast<int (*)(void*)>(m->methodPointer)(row);
+		}
+
+		void Report(void* row, const char* tag, uint64_t endSeen) {
+			const int id = Int(row, "get_Id");
+			if (id <= 0) return;
+			{
+				std::lock_guard<std::mutex> lk(Mtx());
+				if (!Seen().insert(std::string(tag) + "#" + std::to_string(id)).second) return;
+			}
+			char buf[220];
+			snprintf(buf, sizeof(buf), "%-8s id=%-6d type=%-3d begin=%llu end=%llu  (real)",
+				tag, id, Int(row, "get_EventType"),
+				(unsigned long long)Int(row, "get_BeginDate"),
+				(unsigned long long)endSeen);
+			Write(buf);
+		}
+
+		void Apply(void* row, const char* tag) {
+			if (!g_extend_event_dates || inApply) return;
+			const int id = Int(row, "get_Id");
+			if (id <= 0) return;
+			{
+				std::lock_guard<std::mutex> lk(Mtx());
+				if (!Done().insert(id).second) return;
+			}
+			inApply = true;
+			HOOK_CAST_CALL(void, MstEvent_set_BeginDate)(row, PAST_TICKS);
+			HOOK_CAST_CALL(void, MstEvent_set_EndDate)(row, FUTURE_TICKS);
+			inApply = false;
+			char buf[220];
+			snprintf(buf, sizeof(buf), "%-8s id=%-6d begin=%llu end=%llu  (extended, from %s)",
+				"PATCHED", id,
+				(unsigned long long)PAST_TICKS, (unsigned long long)FUTURE_TICKS, tag);
+			Write(buf);
+		}
+	}
+
+	HOOK_ORIG_TYPE MstEvent_set_BeginDate_orig;
+	void MstEvent_set_BeginDate_hook(void* self, uint64_t value) {
+		HOOK_CAST_CALL(void, MstEvent_set_BeginDate)(self, value);
+		EventDates::Report(self, "begin", 0);
+		EventDates::Apply(self, "set_BeginDate");
+	}
+
+	HOOK_ORIG_TYPE MstEvent_set_EndDate_orig;
+	void MstEvent_set_EndDate_hook(void* self, uint64_t value) {
+		HOOK_CAST_CALL(void, MstEvent_set_EndDate)(self, value);
+		EventDates::Report(self, "end", value);
+		EventDates::Apply(self, "set_EndDate");
+	}
+
 	HOOK_ORIG_TYPE DioramaProductViewModel_IsLocked_orig;
 	bool DioramaProductViewModel_IsLocked_hook(void* self) {
 		if (g_unlock_photo_studio) {
@@ -2019,7 +2125,9 @@ namespace
 		}
 	}
 
-#ifdef __OBSOLETE_HOOK__
+	// [PATCH] __OBSOLETE_HOOK__ guard removed - this block declares the globals
+	// (confirmationingModel / cacheDressMap / cacheHairMap / cacheAccessoryMap) that the
+	// costume-unlock code further below needs.
 	bool isCancelTryOn = false;
 	HOOK_ORIG_TYPE LiveCostumeChangeView_setTryOnMode_orig;
 	void LiveCostumeChangeView_setTryOnMode_hook(void* _this, void* idol, bool isTryOn) {
@@ -2207,7 +2315,7 @@ namespace
 			// addToDic(cacheAccessoryMap, accessoryDic);  // TODO PRISM.ResourceManagement.ResourceLoader._throwMissingKeyException
 		}
 	}
-#endif
+	// [PATCH] #endif removed (matching the #ifdef __OBSOLETE_HOOK__ that was deleted above)
 
 
 	void ModifyOnStageIdols(void* onStageIdols) {
@@ -2452,7 +2560,84 @@ namespace
 	}
 
 	HOOK_ORIG_TYPE MainThreadDispatcher_LateUpdate_orig;
+	static bool g_saveAuditScanComplete = false;
+
+	static std::string ToLowerAscii(std::string value) {
+		for (char& c : value) {
+			if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+		}
+		return value;
+	}
+
+	static bool IsSaveAuditType(const char* namespaze, const char* className) {
+		std::string typeName;
+		if (namespaze) typeName += namespaze;
+		typeName += "::";
+		if (className) typeName += className;
+		typeName = ToLowerAscii(std::move(typeName));
+		return typeName.find("sqlite") != std::string::npos
+			|| typeName.find("database") != std::string::npos
+			|| typeName.find("savedata") != std::string::npos
+			|| typeName.find("userdata") != std::string::npos
+			|| typeName.find("localdata") != std::string::npos
+			|| typeName.find("masterdata") != std::string::npos
+			|| typeName.find("emberbox") != std::string::npos;
+	}
+
+	static void DumpSaveAuditMethodSignatures() {
+		std::ofstream output("save-audit-methods.txt", std::ios::trunc);
+		if (!output.is_open()) {
+			printf("[save-audit] Cannot create save-audit-methods.txt\n");
+			return;
+		}
+
+		output << "SCSP save-path metadata scan\n"
+			<< "Method/type signatures only; no arguments, object values, or save files are read.\n\n";
+
+		size_t assemblyCount = 0;
+		auto** assemblies = il2cpp_domain_get_assemblies(il2cpp_domain_get(), &assemblyCount);
+		size_t matchedTypes = 0;
+		size_t writtenMethods = 0;
+		constexpr size_t maxTypes = 500;
+		constexpr size_t maxMethods = 5000;
+
+		for (size_t a = 0; assemblies && a < assemblyCount && matchedTypes < maxTypes && writtenMethods < maxMethods; ++a) {
+			auto* image = il2cpp_assembly_get_image((void*)assemblies[a]);
+			if (!image) continue;
+			const size_t classCount = il2cpp_image_get_class_count(image);
+			for (size_t i = 0; i < classCount && matchedTypes < maxTypes && writtenMethods < maxMethods; ++i) {
+				auto* klass = il2cpp_image_get_class(image, i);
+				if (!klass) continue;
+				const char* namespaze = il2cpp_class_get_namespace((void*)klass);
+				const char* className = il2cpp_class_get_name((void*)klass);
+				if (!IsSaveAuditType(namespaze, className)) continue;
+
+				++matchedTypes;
+				output << "TYPE " << (namespaze ? namespaze : "") << "::"
+					<< (className ? className : "?") << "\n";
+				void* iter = nullptr;
+				const MethodInfo* method = nullptr;
+				while ((method = il2cpp_class_get_methods((void*)klass, &iter)) && writtenMethods < maxMethods) {
+					output << "  " << debug::FormatMethodInfo(method) << "\n";
+					++writtenMethods;
+				}
+				output << "\n";
+			}
+		}
+
+		output << "SUMMARY assemblies=" << assemblyCount
+			<< " matchedTypes=" << matchedTypes
+			<< " methods=" << writtenMethods << "\n";
+		output.close();
+		printf("[save-audit] Wrote %zu type(s), %zu method signature(s) to save-audit-methods.txt\n",
+			matchedTypes, writtenMethods);
+	}
+
 	void MainThreadDispatcher_LateUpdate_hook(void* _this, void* method) {
+		if (!g_saveAuditScanComplete) {
+			g_saveAuditScanComplete = true;
+			DumpSaveAuditMethodSignatures();
+		}
 		try {
 			auto it = mainThreadTasks.begin();
 			while (it != mainThreadTasks.end()) {
@@ -2478,7 +2663,9 @@ namespace
 		return HOOK_CAST_CALL(void, MainThreadDispatcher_LateUpdate)(_this, method);
 	}
 
-#ifdef __OBSOLETE_HOOK__
+	// [PATCH] __OBSOLETE_HOOK__ guard removed - THIS IS THE REAL UNLOCK.
+	// checkAndAddCostume() writes isUnlocked_ = true on every CostumeStatus the client
+	// receives, and the GetCostumeListReply_get_* hooks below feed it the whole list.
 	void checkAndAddCostume(int key, void* value) {
 		static auto CostumeStatus_klass = il2cpp_symbols::get_class("PRISM.Module.Networking.dll",
 			"PRISM.Module.Networking.Stub.Status", "CostumeStatus");
@@ -2559,7 +2746,372 @@ namespace
 		checkCostumeListReply(_this, ret, "mstAccessoryId_");
 		return ret;
 	}
-#endif
+	// [PATCH] #endif removed (matching the #ifdef __OBSOLETE_HOOK__ that was deleted above)
+
+	// =====================================================================
+	// [PATCH] Master row dump v5 - ZERO I/O in the hot path.
+	//
+	//   v4 wrote one file line per getter call, which produced 182 MB /
+	//   4.2 M lines and made the idol list screen hang forever.  v5 only
+	//   records *distinct* values in memory and dumps the contiguous
+	//   MstProduceIdol row array as raw bytes, once every 64 KB of newly
+	//   discovered range.  Total disk traffic stays around 25 MB and no
+	//   file is ever touched from inside a getter that the UI calls in a
+	//   loop.
+	// =====================================================================
+	namespace MasterDump {
+		std::mutex g_mtx;
+		std::set<std::string> g_seen;        // dedupe key "what:v=N"
+		std::set<int> g_idolIds;             // every distinct MstIdolId
+		std::set<int> g_rowIds;              // every distinct Id
+		void* g_lo = nullptr;                // lowest row address seen
+		void* g_hi = nullptr;                // highest row address seen
+		size_t g_dumped = 0;                 // range already written out
+
+		// Record a distinct value.  Returns true if it is new.
+		bool Note(const char* what, bool isIdolId, int value) {
+			if (value <= 0) return false;
+			std::lock_guard<std::mutex> lk(g_mtx);
+			char key[80];
+			snprintf(key, sizeof(key), "%s:v=%d", what, value);
+			if (!g_seen.insert(key).second) return false;
+			(isIdolId ? g_idolIds : g_rowIds).insert(value);
+			std::ofstream f("master-dump.txt", std::ios::app);
+			if (f.is_open()) f << what << " v=" << value << "\n";
+			return true;
+		}
+
+		// Track the row address.  Returns true when the discovered range
+		// grew by at least 64 KB since the last dump (so DumpRows is due).
+		bool Track(void* row) {
+			if (!row) return false;
+			const uintptr_t r = (uintptr_t)row;
+			std::lock_guard<std::mutex> lk(g_mtx);
+			const uintptr_t lo = (uintptr_t)g_lo;
+			const uintptr_t hi = (uintptr_t)g_hi;
+			if (!g_lo || r < lo) g_lo = row;
+			if (!g_hi || r > hi) g_hi = row;
+			if (!g_lo || !g_hi) return false;
+			const uintptr_t nlo = (uintptr_t)g_lo;
+			const uintptr_t nhi = (uintptr_t)g_hi;
+			if (nhi <= nlo) return false;
+			const size_t span = (size_t)(nhi - nlo);
+			if (span >= g_dumped + (64u << 10)) {
+				g_dumped = span;
+				return true;
+			}
+			return false;
+		}
+
+		// Write the discovered row array as raw bytes (capped at 4 MB).
+		void DumpRows() {
+			void* lo = nullptr;
+			size_t n = 0;
+			{
+				std::lock_guard<std::mutex> lk(g_mtx);
+				if (!g_lo || !g_hi) return;
+				const uintptr_t nlo = (uintptr_t)g_lo;
+				const uintptr_t nhi = (uintptr_t)g_hi;
+				if (nhi <= nlo) return;
+				lo = g_lo;
+				n = (size_t)(nhi - nlo) + 1024;
+				const size_t CAP = 4u << 20;
+				if (n > CAP) n = CAP;
+			}
+			std::ofstream f("master-rows.bin", std::ios::binary | std::ios::trunc);
+			if (f.is_open()) {
+				f.write((const char*)lo, (std::streamsize)n);
+				f.flush();
+			}
+		}
+	}
+
+	// =====================================================================
+	// [PATCH] v6 - targeted master row dump.
+	//
+	//   Adding a produce-idol entry for a collab character (378001 ..) makes
+	//   the client reject the WHOLE reply with ErrorCode[BF65431C], which is
+	//   the client's "this field does not match my own master" check (the
+	//   same code the costume work hit when CostumeType was wrong).
+	//
+	//   So the real values have to come from the master row.  This dumps the
+	//   raw bytes of the MstProduceIdol object for a few MstIdolId values
+	//   whose "group" (the reply's f3.f1 / f22.f2) is known from real server
+	//   data: 101 -> 1, 201 -> 2, 301 -> 3.  Diffing those against 378/379/
+	//   383 shows which field carries the group, and what it is for the
+	//   collab characters.
+	// =====================================================================
+	namespace MasterRowDump {
+		std::mutex g_mtx;
+		std::map<int, int> g_count;
+
+		bool wanted(int idolId) {
+			switch (idolId) {
+			case 101: case 102: case 201: case 202: case 301: case 302:
+			case 378: case 379: case 380: case 381: case 383: case 484:
+				return true;
+			default:
+				return false;
+			}
+		}
+
+		// at most 3 objects per MstIdolId (the variants)
+		bool ShouldDump(int idolId) {
+			if (!wanted(idolId)) return false;
+			std::lock_guard<std::mutex> lk(g_mtx);
+			int& c = g_count[idolId];
+			if (c >= 3) return false;
+			++c;
+			return true;
+		}
+
+		void Dump(void* obj, int idolId) {
+			std::ofstream f("master-rows2.txt", std::ios::app);
+			if (!f.is_open()) return;
+			f << "=== MstIdolId " << idolId << " ptr=" << obj << "\n";
+			const unsigned char* p = (const unsigned char*)obj;
+			for (int i = 0; i < 256; i += 16) {
+				char line[160];
+				int n = snprintf(line, sizeof(line), "  +%03d ", i);
+				char ascii[17];
+				ascii[16] = 0;
+				for (int j = 0; j < 16; ++j) {
+					const unsigned char c = p[i + j];
+					n += snprintf(line + n, sizeof(line) - n, "%02X ", c);
+					ascii[j] = (c >= 32 && c < 127) ? (char)c : '.';
+				}
+				snprintf(line + n, sizeof(line) - n, " %s", ascii);
+				f << line << "\n";
+			}
+			f.flush();
+		}
+	}
+
+	// =====================================================================
+	// [PATCH] v7 - limited-time gate bypass + master field dump.
+	//
+	//   The collab characters (78..89) and their produce idols (378xxx..389xxx)
+	//   are "limited time" (期間限定) content.  The client refuses any reply
+	//   entry that points at them with ErrorCode[BF65431C] because the period
+	//   is over - this is why adding their P cards crashed the character list.
+	//
+	//   The master rows expose IsLimitedTimeUnlock / UnlockPremise /
+	//   DressOrderBeginDate (confirmed in global-metadata.dat).  The old mod
+	//   NOP'ed the check at a fixed RVA (revertgate 0x03DCA0E9) which no longer
+	//   matches, so instead we force the flag OFF on every master row that has
+	//   it - build independent.
+	// =====================================================================
+#define LIMITED_TIME_GATE_HOOK(klass) \
+	HOOK_ORIG_TYPE klass##_get_IsLimitedTimeUnlock_orig; \
+	bool klass##_get_IsLimitedTimeUnlock_hook(void* _this) { \
+		(void)HOOK_CAST_CALL(bool, klass##_get_IsLimitedTimeUnlock)(_this); \
+		return false; \
+	}
+
+	LIMITED_TIME_GATE_HOOK(MstCostume)
+	LIMITED_TIME_GATE_HOOK(MstHairstyle)
+	LIMITED_TIME_GATE_HOOK(MstAccessory)
+	LIMITED_TIME_GATE_HOOK(MstProduceIdol)
+	LIMITED_TIME_GATE_HOOK(MstIdol)
+	LIMITED_TIME_GATE_HOOK(MstCharacterInfo)
+
+	// dump the method names of the interesting master classes (once)
+	void DumpMasterFields() {
+		static const char* kDump[] = { "MstProduceIdol", "MstIdol", "MstCharacterInfo", "MstCostume", "MstAccessory" };
+		std::ofstream f("mst-fields.txt", std::ios::app);
+		if (!f.is_open()) return;
+		for (const char* cn : kDump) {
+			f << "=== " << cn << " methods ===\n";
+			auto k = il2cpp_symbols_logged::get_class("PRISM.Definitions.dll", "PRISM.Definitions", cn);
+			if (!k) { f << "  (class not found)\n"; continue; }
+			void* iter = nullptr;
+			while (auto mi = il2cpp_class_get_methods(k, &iter)) {
+				const char* mn = il2cpp_method_get_name(mi);
+				f << "  " << (mn ? mn : "?") << " /" << il2cpp_method_get_param_count(mi) << "\n";
+			}
+		}
+		// [PATCH] v8 - the networking side (error handling + the reply entry type)
+		struct NetType { const char* dll; const char* ns; const char* cls; };
+		static const NetType kNet[] = {
+			{ "PRISM.Module.Networking.dll", "PRISM.Module.Networking", "ErrorHandler" },
+			{ "PRISM.Module.Networking.dll", "PRISM.Module.Networking.Stub.Status", "ProduceIdolStatus" },
+		};
+		for (const auto& nt : kNet) {
+			f << "=== " << nt.cls << " methods ===\n";
+			auto k = il2cpp_symbols_logged::get_class(nt.dll, nt.ns, nt.cls);
+			if (!k) { f << "  (class not found)\n"; continue; }
+			void* iter = nullptr;
+			while (auto mi = il2cpp_class_get_methods(k, &iter)) {
+				const char* mn = il2cpp_method_get_name(mi);
+				f << "  " << (mn ? mn : "?") << " /" << il2cpp_method_get_param_count(mi) << "\n";
+			}
+		}
+		f.flush();
+	}
+
+	// =====================================================================
+	// [PATCH] v8 - dump the master field VALUES of a few MstProduceIdol rows.
+	//
+	//   Adding a produce-idol entry for a collab character (378001 ..) makes the
+	//   client reject the whole reply (ErrorCode[BF65431C]).  MstProduceIdol has
+	//   no IsLimitedTimeUnlock field, so the check is on one of its real fields.
+	//   Dumping the getters of a working row (301/302, type 3) and of the collab
+	//   rows (378/379/381, whatever type they really are) shows the difference.
+	// =====================================================================
+	namespace MasterFieldDump {
+		std::mutex g_mtx;
+		std::set<int> g_done;
+
+		bool wanted(int idolId) {
+			switch (idolId) {
+			case 202: case 301: case 302: case 378: case 379: case 381: case 484:
+				return true;
+			default:
+				return false;
+			}
+		}
+
+		bool ShouldDump(int idolId) {
+			if (!wanted(idolId)) return false;
+			std::lock_guard<std::mutex> lk(g_mtx);
+			return g_done.insert(idolId).second;
+		}
+
+		void Dump(void* obj, int idolId) {
+			// only real MstProduceIdol instances (compare by class NAME; the
+			// class pointer from get_class() is not the same instance-cache one)
+			auto inst = il2cpp_symbols::get_class_from_instance(obj);
+			if (!inst) return;
+			const char* clsName = il2cpp_class_get_name(inst);
+			if (!clsName || strcmp(clsName, "MstProduceIdol") != 0) return;
+			auto klass = inst;
+
+			std::ofstream f("mst-values.txt", std::ios::app);
+			if (!f.is_open()) return;
+			f << "=== MstIdolId " << idolId << " ===\n";
+
+			static const char* kIntGetters[] = {
+				"get_Id", "get_ProduceIdolType", "get_MstIdolId", "get_InitialStar",
+				"get_InitialVocal", "get_InitialDance", "get_InitialVisual", "get_InitialMental",
+				"get_LimitVocal", "get_LimitDance", "get_LimitVisual", "get_LimitMental",
+				"get_MaxLevelVocal", "get_MaxLevelDance", "get_MaxLevelVisual", "get_MaxLevelMental",
+				"get_Attribute", "get_MstLiveCenterEffectId", "get_MstLiveSkillId",
+				"get_LimitBreakRecipeProductId", "get_EvolutionRecipeGroupId",
+				"get_GashaVoiceMstVoiceResourceId", "get_GashaSeMstVoiceResourceId",
+				"get_SignPositionIndex",
+			};
+			for (const char* gn : kIntGetters) {
+				auto mi = il2cpp_class_get_method_from_name(klass, gn, 0);
+				if (!mi || !mi->methodPointer) { f << "  " << gn << " : (missing)\n"; continue; }
+				const int v = reinterpret_cast<int(*)(void*)>(mi->methodPointer)(obj);
+				f << "  " << gn << " = " << v << "\n";
+			}
+
+			// get_ReleaseDate returns a DateTime (one 8-byte ulong) -> RAX on x64
+			auto rd = il2cpp_class_get_method_from_name(klass, "get_ReleaseDate", 0);
+			if (rd && rd->methodPointer) {
+				const long long v = reinterpret_cast<long long(*)(void*)>(rd->methodPointer)(obj);
+				f << "  get_ReleaseDate(ticks) = " << v << "\n";
+			}
+
+			auto nameM = il2cpp_class_get_method_from_name(klass, "get_Name", 0);
+			if (nameM && nameM->methodPointer) {
+				auto s = reinterpret_cast<Il2CppString * (*)(void*)>(nameM->methodPointer)(obj);
+				if (s) f << "  get_Name = " << utility::conversions::to_utf8string(std::wstring(s->start_char)) << "\n";
+			}
+			f.flush();
+		}
+	}
+
+	// =====================================================================
+	// [PATCH] v9 - capture the client's own error report.
+	//
+	//   Everything points at the client rejecting the reply during its own
+	//   validation (ErrorCode[BF65431C] -> PRISM.Global._systemReset ->
+	//   Limelight SoftReset).  PRISM.Module.Networking.ErrorHandler is the class
+	//   that turns a failure into that error, so hooking it prints the real
+	//   reason (class + ToString + raw bytes of the argument).
+	// =====================================================================
+	HOOK_ORIG_TYPE ErrorHandler_Handle_orig;
+	void* ErrorHandler_Handle_hook(void* _this, void* arg, MethodInfo* method) {
+		try {
+			std::ofstream f("errhandler.txt", std::ios::app);
+			if (f.is_open() && arg) {
+				auto k = il2cpp_symbols::get_class_from_instance(arg);
+				const char* kn = k ? il2cpp_class_get_name(k) : "?";
+				f << "=== ErrorHandler.Handle arg class=" << (kn ? kn : "?") << "\n";
+				if (k) {
+					auto ts = il2cpp_class_get_method_from_name(k, "ToString", 0);
+					if (ts && ts->methodPointer) {
+						auto s = reinterpret_cast<Il2CppString * (*)(void*)>(ts->methodPointer)(arg);
+						if (s) f << "  ToString = " << utility::conversions::to_utf8string(std::wstring(s->start_char)) << "\n";
+					}
+				}
+				const unsigned char* p = (const unsigned char*)arg;
+				for (int i = 0; i < 128; i += 16) {
+					char line[160];
+					int n = snprintf(line, sizeof(line), "  +%03d ", i);
+					char ascii[17];
+					ascii[16] = 0;
+					for (int j = 0; j < 16; ++j) {
+						const unsigned char c = p[i + j];
+						n += snprintf(line + n, sizeof(line) - n, "%02X ", c);
+						ascii[j] = (c >= 32 && c < 127) ? (char)c : '.';
+					}
+					snprintf(line + n, sizeof(line) - n, " %s", ascii);
+					f << line << "\n";
+				}
+				f.flush();
+			}
+		}
+		catch (...) {}
+		return HOOK_CAST_CALL(void*, ErrorHandler_Handle)(_this, arg, method);
+	}
+
+	HOOK_ORIG_TYPE MstProduceIdol_get_Id_orig;
+	int MstProduceIdol_get_Id_hook(void* _this) {
+		int v = HOOK_CAST_CALL(int, MstProduceIdol_get_Id)(_this);
+		if (v > 0) {
+			if (MasterDump::Note("get_Id", false, v) || MasterDump::Track(_this)) {
+				MasterDump::DumpRows();
+			}
+		}
+		return v;
+	}
+
+	HOOK_ORIG_TYPE MstProduceIdol_get_MstIdolId_orig;
+	int MstProduceIdol_get_MstIdolId_hook(void* _this) {
+		int v = HOOK_CAST_CALL(int, MstProduceIdol_get_MstIdolId)(_this);
+		if (v > 0) {
+			// [PATCH] v6 targeted row dump (see MasterRowDump above)
+			if (MasterRowDump::ShouldDump(v)) MasterRowDump::Dump(_this, v);
+			// [PATCH] v8 field values (see MasterFieldDump above)
+			if (MasterFieldDump::ShouldDump(v)) MasterFieldDump::Dump(_this, v);
+			if (MasterDump::Note("get_MstIdolId", true, v) || MasterDump::Track(_this)) {
+				MasterDump::DumpRows();
+			}
+		}
+		return v;
+	}
+
+	HOOK_ORIG_TYPE MstProduceIdol_set_Id_orig;
+	HOOK_ORIG_TYPE MstProduceIdol_set_MstIdolId_orig;
+	void MstProduceIdol_set_Id_hook(void* _this, int value) {
+		HOOK_CAST_CALL(void, MstProduceIdol_set_Id)(_this, value);
+		if (value > 0) {
+			if (MasterDump::Note("set_Id", false, value) || MasterDump::Track(_this)) {
+				MasterDump::DumpRows();
+			}
+		}
+	}
+	void MstProduceIdol_set_MstIdolId_hook(void* _this, int value) {
+		HOOK_CAST_CALL(void, MstProduceIdol_set_MstIdolId)(_this, value);
+		if (value > 0) {
+			if (MasterDump::Note("set_MstIdolId", true, value) || MasterDump::Track(_this)) {
+				MasterDump::DumpRows();
+			}
+		}
+	}
 
 	HOOK_ORIG_TYPE LiveMVUnitConfirmationModel_ctor_orig;
 	void LiveMVUnitConfirmationModel_ctor_hook(void* _this, void* musicData, void* saveData, void* unitListReply, void* costumeService, void* autoCoordinateFlag) {
@@ -3885,10 +4437,12 @@ namespace
 		ADD_HOOK_1(SpawnCharacter_CreateCharacter);
 		ADD_HOOK(AssembleCharacter_ApplyParam, "AssembleCharacter_ApplyParam at %p");
 		ADD_HOOK(MainThreadDispatcher_LateUpdate, "MainThreadDispatcher_LateUpdate at %p");
-		//ADD_HOOK(dic_int_ICostumeStatus_add, "dic_int_ICostumeStatus_add at %p");
-		//ADD_HOOK(GetCostumeListReply_get_CostumeList, "GetCostumeListReply_get_CostumeList at %p");
-		//ADD_HOOK(GetCostumeListReply_get_HairstyleList, "GetCostumeListReply_get_HairstyleList at %p");
-		//ADD_HOOK(GetCostumeListReply_get_AccessoryList, "GetCostumeListReply_get_AccessoryList at %p");
+		// [PATCH] enabled - these feed checkAndAddCostume() so every costume the server
+		// sends gets isUnlocked_ = true (the "real" unlock the preview screen shows).
+		ADD_HOOK(dic_int_ICostumeStatus_add, "dic_int_ICostumeStatus_add at %p");
+		ADD_HOOK(GetCostumeListReply_get_CostumeList, "GetCostumeListReply_get_CostumeList at %p");
+		ADD_HOOK(GetCostumeListReply_get_HairstyleList, "GetCostumeListReply_get_HairstyleList at %p");
+		ADD_HOOK(GetCostumeListReply_get_AccessoryList, "GetCostumeListReply_get_AccessoryList at %p");
 		ADD_HOOK(LiveMVUnitConfirmationModel_ctor, "LiveMVUnitConfirmationModel_ctor at %p");
 		ADD_HOOK(RunwayUnitConfirmationModel_ctor, "RunwayUnitConfirmationModel_ctor at %p");
 		ADD_HOOK(SwayString_SetupPoint, "SwayString_SetupPoint at %p");
@@ -3922,6 +4476,46 @@ namespace
 		ADD_HOOK_1(CostumeChangeViewModel_CanDecide0);
 		ADD_HOOK_1(CostumeChangeViewModel_CanDecide2);
 		ADD_HOOK_ADDR(PRISM.Adapters.dll, PRISM.Adapters.CostumeChange, CostumeChangeViewModel, RefreshViewModels, 0);
+		// [PATCH] v7 - limited-time gate bypass (see the hooks above).
+		// Resolve at runtime so a class that has no such getter is harmless.
+#define INSTALL_LIMITED_TIME_GATE(klass) \
+		{ \
+			auto k = il2cpp_symbols_logged::get_class("PRISM.Definitions.dll", "PRISM.Definitions", #klass); \
+			auto m = k ? il2cpp_class_get_method_from_name(k, "get_IsLimitedTimeUnlock", 0) : nullptr; \
+			if (m && m->methodPointer) { \
+				MH_CreateHook((void*)m->methodPointer, (void*)klass##_get_IsLimitedTimeUnlock_hook, &klass##_get_IsLimitedTimeUnlock_orig); \
+				MH_EnableHook((void*)m->methodPointer); \
+				printf("[v7] limited-time gate OFF on %s\n", #klass); \
+			} \
+			else { \
+				printf("[v7] %s has no get_IsLimitedTimeUnlock\n", #klass); \
+			} \
+		}
+		INSTALL_LIMITED_TIME_GATE(MstCostume)
+		INSTALL_LIMITED_TIME_GATE(MstHairstyle)
+		INSTALL_LIMITED_TIME_GATE(MstAccessory)
+		INSTALL_LIMITED_TIME_GATE(MstProduceIdol)
+		INSTALL_LIMITED_TIME_GATE(MstIdol)
+		INSTALL_LIMITED_TIME_GATE(MstCharacterInfo)
+		DumpMasterFields();
+		// [PATCH] v9 - capture the client's error report (see the hook above)
+		ADD_HOOK_ADDR(PRISM.Module.Networking.dll, PRISM.Module.Networking, ErrorHandler, Handle, 1);
+
+		// [PATCH] master row dump for MstProduceIdol (see the hooks above)
+		{
+			std::ofstream f("master-dump.txt", std::ios::app);
+			if (f.is_open()) f << "=== dump patch v7 active ===\n";
+		}
+		ADD_HOOK_ADDR(PRISM.Definitions.dll, PRISM.Definitions, MstProduceIdol, get_Id, 0);
+		ADD_HOOK_ADDR(PRISM.Definitions.dll, PRISM.Definitions, MstProduceIdol, get_MstIdolId, 0);
+		ADD_HOOK_ADDR(PRISM.Definitions.dll, PRISM.Definitions, MstProduceIdol, set_Id, 1);
+		ADD_HOOK_ADDR(PRISM.Definitions.dll, PRISM.Definitions, MstProduceIdol, set_MstIdolId, 1);
+
+		// permanent limited-time events: rewrite MstEvent.BeginDate / EndDate
+		// (see the EventDates block above).  mst-events.txt records the real
+		// dates; "extendEventDates" in scsp-config.json turns the patch on.
+		ADD_HOOK_ADDR(PRISM.Definitions.dll, PRISM.Definitions, MstEvent, set_BeginDate, 1);
+		ADD_HOOK_ADDR(PRISM.Definitions.dll, PRISM.Definitions, MstEvent, set_EndDate, 1);
 
 		tools::AddNetworkingHooks();
 
