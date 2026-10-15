@@ -793,6 +793,10 @@ namespace
 	extern bool g_extend_event_dates;   // defined in main.cpp, declared in stdinclude.hpp
 	HOOK_ORIG_TYPE MstEvent_set_BeginDate_orig;
 	HOOK_ORIG_TYPE MstEvent_set_EndDate_orig;
+	// forward declarations: HOOK_CAST_CALL expands to decltype(<name>_hook) in the
+	// MinHook build, so the hook functions must be visible where Apply() calls them.
+	void MstEvent_set_BeginDate_hook(void* self, uint64_t value);
+	void MstEvent_set_EndDate_hook(void* self, uint64_t value);
 
 	namespace EventDates {
 		constexpr uint64_t PAST_TICKS   = 630822816000000000ULL;  // 2000-01-01
