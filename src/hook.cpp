@@ -790,7 +790,6 @@ namespace
 	//   real dates, so the data is verifiable even with the patch switched
 	//   off (scsp-config.json: "extendEventDates").
 	// =====================================================================
-	extern bool g_extend_event_dates;   // defined in main.cpp, declared in stdinclude.hpp
 	HOOK_ORIG_TYPE MstEvent_set_BeginDate_orig;
 	HOOK_ORIG_TYPE MstEvent_set_EndDate_orig;
 	// forward declarations: HOOK_CAST_CALL expands to decltype(<name>_hook) in the
@@ -848,8 +847,31 @@ namespace
 			Write(buf);
 		}
 
+		// Read the on/off flag straight from scsp-config.json.  Doing the lookup
+		// here keeps the patch self contained - the file is read once, from the
+		// game's working directory, and needs no extern global (a stray extern
+		// inside this anonymous namespace would get internal linkage).
+		bool Enabled() {
+			static const bool on = [] {
+				std::ifstream f("scsp-config.json");
+				if (!f.is_open()) return false;
+				std::string s;
+				char buf[4096];
+				while (f.good()) {
+					f.read(buf, sizeof(buf));
+					if (f.gcount() > 0) s.append(buf, (size_t)f.gcount());
+				}
+				const auto key = s.find("\"extendEventDates\"");
+				if (key == std::string::npos) return false;
+				const auto yes = s.find("true", key);
+				const auto no = s.find("false", key);
+				return yes != std::string::npos && (no == std::string::npos || yes < no);
+			}();
+			return on;
+		}
+
 		void Apply(void* row, const char* tag) {
-			if (!g_extend_event_dates || inApply) return;
+			if (!Enabled() || inApply) return;
 			const int id = Int(row, "get_Id");
 			if (id <= 0) return;
 			{
