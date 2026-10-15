@@ -790,6 +790,10 @@ namespace
 	//   real dates, so the data is verifiable even with the patch switched
 	//   off (scsp-config.json: "extendEventDates").
 	// =====================================================================
+	extern bool g_extend_event_dates;   // defined in main.cpp, declared in stdinclude.hpp
+	HOOK_ORIG_TYPE MstEvent_set_BeginDate_orig;
+	HOOK_ORIG_TYPE MstEvent_set_EndDate_orig;
+
 	namespace EventDates {
 		constexpr uint64_t PAST_TICKS   = 630822816000000000ULL;  // 2000-01-01
 		constexpr uint64_t FUTURE_TICKS = 642830804470000000ULL;  // 2038-01-19
@@ -821,7 +825,7 @@ namespace
 
 		int Int(void* row, const char* getter) {
 			auto m = Method(getter, 0);
-			if (!m || m->methodPointer == nullptr) return 0;
+			if (!m || m->methodPointer == 0) return 0;
 			return reinterpret_cast<int (*)(void*)>(m->methodPointer)(row);
 		}
 
@@ -860,14 +864,13 @@ namespace
 		}
 	}
 
-	HOOK_ORIG_TYPE MstEvent_set_BeginDate_orig;
+	// trampolines are declared above (before EventDates) so Apply() can call them
 	void MstEvent_set_BeginDate_hook(void* self, uint64_t value) {
 		HOOK_CAST_CALL(void, MstEvent_set_BeginDate)(self, value);
 		EventDates::Report(self, "begin", 0);
 		EventDates::Apply(self, "set_BeginDate");
 	}
 
-	HOOK_ORIG_TYPE MstEvent_set_EndDate_orig;
 	void MstEvent_set_EndDate_hook(void* self, uint64_t value) {
 		HOOK_CAST_CALL(void, MstEvent_set_EndDate)(self, value);
 		EventDates::Report(self, "end", value);
