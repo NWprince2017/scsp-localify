@@ -39,8 +39,8 @@ bool g_block_out_of_focus = false;
 float g_free_camera_mouse_speed = 35;
 bool g_allow_use_tryon_costume = false;
 bool g_allow_same_idol = false;
-bool g_unlock_all_dress = false;     // save-audit diagnostic build: preserve save state
-bool g_unlock_all_headwear = false;  // save-audit diagnostic build: preserve save state
+bool g_unlock_all_dress = true;      // [PATCH] real costume unlock (config: unlockAllDress)
+bool g_unlock_all_headwear = true;   // [PATCH] unlocks hairstyles/accessories (config: unlockAllHeadwear)
 bool g_show_hidden_costumes = false;
 bool g_save_and_replace_costume_changes = false;
 bool g_overrie_mv_unit_idols = false;
@@ -263,6 +263,12 @@ namespace
 			}
 			if (document.HasMember("unlockPhotoStudio")) {
 				g_unlock_photo_studio = document["unlockPhotoStudio"].GetBool();
+			}
+			if (document.HasMember("unlockAllDress")) {
+				g_unlock_all_dress = document["unlockAllDress"].GetBool();
+			}
+			if (document.HasMember("unlockAllHeadwear")) {
+				g_unlock_all_headwear = document["unlockAllHeadwear"].GetBool();
 			}
 			if (document.HasMember("extendEventDates")) {
 				g_extend_event_dates = document["extendEventDates"].GetBool();
