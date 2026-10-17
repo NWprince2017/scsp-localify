@@ -6,7 +6,6 @@
 #include <cstdint>
 #include <Psapi.h>
 #include <intsafe.h>
-#include <intrin.h>
 #include "scgui/scGUIData.hpp"
 #include <scgui/scGUIMain.hpp>
 #include <mhotkey.hpp>
@@ -802,195 +801,198 @@ namespace
 	//   mst-events.txt always records the real values, so the data is verifiable
 	//   even with the patch switched off (scsp-config.json "extendEventDates").
 	//
-	//   v12 (diagnostic): the 1:28 session never produced mst-events.txt, i.e. the
-	//   v11 getter was never called (or never resolved).  v12 therefore
-	//      - also overrides get_DisplayEndDate (the property that carries the
-	//        *displayed* end date - the gate the UI is most likely to read),
-	//      - records EVERY distinct getter call with the calling managed method
-	//        (mst-events-calls.txt) plus an install report (runway-diag.txt),
-	//      - dumps the client's own MasterData.Events table once per session
-	//        (mst-events-table.txt) to see which rows exist and their real dates.
-	//   All of it is still strictly read-only.
+	//   v13 (diagnostic, NO hooks): v12 crashed the game twice right after it
+	//   installed its hooks (0xc0000005 inside GameAssembly, same offset both
+	//   runs).  runway-diag.txt showed why the getters cannot be hooked:
+	//   get_EndDate / get_BeginDate report MH_ERROR_ALREADY_CREATED (their code
+	//   addresses are already hooked or shared via ICF with unrelated methods -
+	//   which is also why v11 never produced mst-events.txt), and the two new
+	//   hooks that did install sit on addresses shared by other getters.
+	//   v13 therefore installs NOTHING and calls NOTHING: it reads the real
+	//   stored values straight out of MasterData.Events by field offset
+	//   (mst-events-table.txt) and writes an install report (runway-diag.txt).
 	// =====================================================================
-	HOOK_ORIG_TYPE MstEvent_get_EndDate_orig;
-	// forward declarations: HOOK_CAST_CALL expands to decltype(<name>_hook) in the
-	// MinHook build, so the hook functions must be visible where they are used.
-	uint64_t MstEvent_get_EndDate_hook(void* self);
-	HOOK_ORIG_TYPE MstEvent_get_DisplayEndDate_orig;
-	uint64_t MstEvent_get_DisplayEndDate_hook(void* self);
-	HOOK_ORIG_TYPE MstEvent_get_BeginDate_orig;
-	uint64_t MstEvent_get_BeginDate_hook(void* self);
-	HOOK_ORIG_TYPE MstEvent_get_EventType_orig;
-	int MstEvent_get_EventType_hook(void* self);
 
 	namespace EventDates {
-		constexpr uint64_t PAST_TICKS   = 630822816000000000ULL;  // 2000-01-01
-		constexpr uint64_t FUTURE_TICKS = 642830804470000000ULL;  // 2038-01-19
-
+		// v13: strictly read-only master dump.  No hooks, no managed calls -
+		// every value is read straight out of the master objects by field
+		// offset, so nothing here can execute game code or write memory.
 		std::mutex& Mtx() { static std::mutex m; return m; }
-		std::set<std::string>& Seen() { static std::set<std::string> s; return s; }
-		std::set<int>& Done() { static std::set<int> s; return s; }
-		thread_local bool inApply = false;
 
-		void Write(const std::string& line) {
-			std::lock_guard<std::mutex> lk(Mtx());
-			std::ofstream f("mst-events.txt", std::ios::app);
-			if (!f.is_open()) return;
-			f << line << "\n";
-			f.flush();
-		}
-
-		// v12: resolve a code address back to the managed method containing it
-		// (debug::ResolveAddress builds a sorted method table on first use - one
-		// small one-time hitch, then binary search).
-		std::string Caller(uintptr_t pc) {
-			static std::mutex m;
-			static std::map<uintptr_t, std::string> cache;
-			std::lock_guard<std::mutex> lk(m);
-			auto it = cache.find(pc);
-			if (it != cache.end()) return it->second;
-			std::string s = "?";
-			try {
-				auto mi = debug::ResolveAddress(pc);
-				if (mi) s = debug::FormatMethodInfo(mi);
-			}
-			catch (...) { s = "resolve-error"; }
-			char b[40];
-			snprintf(b, sizeof(b), " (pc=0x%llx)", (unsigned long long)pc);
-			s += b;
-			cache[pc] = s;
-			return s;
-		}
-
-		// v12: record EVERY distinct getter call (tag + object + raw value) with
-		// its calling method - no value filter, so "the getter is never called"
-		// can be told apart from "the value is not what we think".  Budgeted so
-		// a per-frame caller cannot flood the file.
-		void LogCall(const char* tag, void* self, uint64_t raw, uintptr_t pc) {
-			static std::mutex m;
-			static std::map<std::string, std::pair<void*, uint64_t>> last;
-			static int budget = 1500;
-			std::lock_guard<std::mutex> lk(m);
-			auto& l = last[tag];
-			if (l.first == self && l.second == raw) return;
-			l = { self, raw };
-			if (budget <= 0) return;
-			--budget;
-			std::ofstream f("mst-events-calls.txt", std::ios::app);
-			if (!f.is_open()) return;
-			f << "t=" << (GetTickCount64() / 1000) << "s " << tag
-				<< " self=0x" << std::hex << (uintptr_t)self << std::dec
-				<< " raw=" << raw << " (0x" << std::hex << raw << std::dec << ")"
-				<< " <- " << Caller(pc) << "\n";
-			f.flush();
-		}
-
-		MethodInfo* Method(const char* name, int argc) {
-			static std::map<std::string, MethodInfo*> cache;
-			const std::string key = std::string(name) + "#" + std::to_string(argc);
-			auto it = cache.find(key);
-			if (it != cache.end()) return it->second;
-			static auto klass = il2cpp_symbols_logged::get_class(
-				"PRISM.Definitions.dll", "PRISM.Definitions", "MstEvent");
-			MethodInfo* m = klass ? il2cpp_symbols_logged::get_method(klass, name, argc) : nullptr;
-			cache[key] = m;
-			return m;
-		}
-
-		int Int(void* row, const char* getter) {
-			auto m = Method(getter, 0);
-			if (!m || m->methodPointer == 0) return 0;
-			return reinterpret_cast<int (*)(void*)>(m->methodPointer)(row);
-		}
-
-		// Log the real value, but only inspect the object when the returned value
-		// already looks like DateTime ticks - that proves the target and the
-		// calling convention are the ones we think they are, so calling get_Id /
-		// get_EventType / get_BeginDate on it is safe.
-		void Report(void* row, const char* tag, uint64_t endSeen) {
-			if (endSeen < 630822816000000000ULL || endSeen > 662687040000000000ULL) return;
-			const int id = Int(row, "get_Id");
-			{
-				std::lock_guard<std::mutex> lk(Mtx());
-				if (!Seen().insert(std::string(tag) + "#" + std::to_string(id) + "#" + std::to_string(endSeen)).second) return;
-			}
-			char buf[220];
-			snprintf(buf, sizeof(buf), "%-8s id=%-6d type=%-6d begin=%llu end=%llu  (real)",
-				tag, id, Int(row, "get_EventType"),
-				(unsigned long long)Int(row, "get_BeginDate"),
-				(unsigned long long)endSeen);
-			Write(buf);
-		}
-
-		// Read the on/off flag straight from scsp-config.json.  Doing the lookup
-		// here keeps the patch self contained - the file is read once, from the
-		// game's working directory, and needs no extern global (a stray extern
-		// inside this anonymous namespace would get internal linkage).
-		bool Enabled() {
-			static const bool on = [] {
-				std::ifstream f("scsp-config.json");
-				if (!f.is_open()) return false;
-				std::string s;
-				char buf[4096];
-				while (f.good()) {
-					f.read(buf, sizeof(buf));
-					if (f.gcount() > 0) s.append(buf, (size_t)f.gcount());
-				}
-				const auto key = s.find("\"extendEventDates\"");
-				if (key == std::string::npos) return false;
-				const auto yes = s.find("true", key);
-				const auto no = s.find("false", key);
-				return yes != std::string::npos && (no == std::string::npos || yes < no);
-			}();
-			return on;
-		}
-
-		// Read-only decision helper.  Never writes memory: it only decides which
-		// value the getter hands back, and only for values that are clearly
-		// DateTime ticks (2000..2100) - see the v11 note above.
-		uint64_t Override(uint64_t real) {
-			if (real < 630822816000000000ULL || real > 662687040000000000ULL) return real;
-			if (!Enabled()) return real;
-			return FUTURE_TICKS;
-		}
-
-		// ---------------- v12 master table dump ----------------
-		// MasterData.Events (name verified against global-metadata.dat) holds the
-		// MstEvent table.  Dump the client's own rows once per session so the real
-		// stored dates can be compared with what the getters report.
 		void DumpLine(const std::string& line) {
+			std::lock_guard<std::mutex> lk(Mtx());
 			std::ofstream f("mst-events-table.txt", std::ios::app);
 			if (!f.is_open()) return;
 			f << line << "\n";
 			f.flush();
 		}
 
-		// call the *original* getter (bypassing our hook) so the dump shows the
-		// values actually stored in the master rows
-		uint64_t RawGetter(HOOK_ORIG_TYPE& orig, const char* name, void* row) {
-			void* fn = orig;
-			if (!fn) {
-				auto m = Method(name, 0);
-				if (!m || !m->methodPointer) return 0;
-				fn = (void*)m->methodPointer;
-			}
-			return ((uint64_t(*)(void*))fn)(row);
+		bool PlausiblePtr(uint64_t p) {
+			return p >= 0x10000ULL && p < 0x7FFFFFFFFFFFULL && (p & 7) == 0;
+		}
+
+		// klass pointer of a live object = first 8 bytes (pure read)
+		void* ClassOf(void* obj) {
+			if (!obj || !PlausiblePtr((uint64_t)obj)) return nullptr;
+			return il2cpp_symbols::get_class_from_instance(obj);
+		}
+
+		const char* ClassNameOf(void* obj) {
+			auto k = ClassOf(obj);
+			return k ? il2cpp_class_get_name(k) : nullptr;
+		}
+
+		FieldInfo* Field(void* klass, const char* name) {
+			return klass ? il2cpp_symbols_logged::il2cpp_class_get_field_from_name(klass, name) : nullptr;
+		}
+
+		void* ReadPtr(void* obj, const char* fieldName) {
+			auto fi = Field(ClassOf(obj), fieldName);
+			if (!fi) return nullptr;
+			return il2cpp_symbols::read_field<void*>(obj, fi);
+		}
+
+		int ReadInt(void* obj, const char* fieldName) {
+			auto fi = Field(ClassOf(obj), fieldName);
+			if (!fi) return -1;
+			return il2cpp_symbols::read_field<int>(obj, fi);
+		}
+
+		std::string Hex(uint64_t v) {
+			char b[32];
+			snprintf(b, sizeof(b), "%llx", (unsigned long long)v);
+			return b;
+		}
+
+		std::string PtrStr(void* p) { return "0x" + Hex((uint64_t)p); }
+
+		// IL2CPP array on x64: [klass(8) monitor(8) bounds(8) max_length(4)+pad]
+		// -> elements start at +0x20
+		int ArrayLength(void* arr) {
+			if (!arr || !PlausiblePtr((uint64_t)arr)) return 0;
+			int n = *reinterpret_cast<int*>(reinterpret_cast<uintptr_t>(arr) + 0x18);
+			return (n >= 0 && n <= 1000000) ? n : 0;
+		}
+		uintptr_t ArrayElem(void* arr, int i, int stride) {
+			return reinterpret_cast<uintptr_t>(arr) + 0x20 + (size_t)i * stride;
+		}
+
+		// MstEvent backing fields (names verified against global-metadata.dat)
+		struct MstFields {
+			FieldInfo* id = nullptr;
+			FieldInfo* type = nullptr;
+			FieldInfo* begin = nullptr;
+			FieldInfo* end = nullptr;
+			FieldInfo* dispEnd = nullptr;
+		};
+		MstFields& Fields() {
+			static MstFields f = [] {
+				MstFields r;
+				auto k = il2cpp_symbols_logged::get_class("PRISM.Definitions.dll", "PRISM.Definitions", "MstEvent");
+				if (k) {
+					r.id = Field(k, "<Id>k__BackingField");
+					r.type = Field(k, "<EventType>k__BackingField");
+					r.begin = Field(k, "<BeginDate>k__BackingField");
+					r.end = Field(k, "<EndDate>k__BackingField");
+					r.dispEnd = Field(k, "<DisplayEndDate>k__BackingField");
+				}
+				return r;
+			}();
+			return f;
+		}
+
+		// (v13: no call logging, no caller resolution, no managed method calls -
+		// all values are read straight from the row's fields.)
+
+		// ---------------- v13 master table dump (pure field reads) ----------------
+		// MasterData.Events (name verified against global-metadata.dat) holds the
+		// MstEvent table.  Dump the client's own rows once per session so the real
+		// stored dates can be compared with what the getters report.  Every value
+		// below is read straight from the object graph - no method is called.
+		std::string CN(void* o) {
+			const char* n = ClassNameOf(o);
+			return n ? n : "?";
 		}
 
 		void DumpRow(void* item, int* count) {
 			if (!item || *count >= 4000) return;
+			if (!PlausiblePtr((uint64_t)item)) return;
 			auto k = il2cpp_symbols::get_class_from_instance(item);
 			const char* cn = k ? il2cpp_class_get_name(k) : nullptr;
 			if (!cn || strcmp(cn, "MstEvent") != 0) return;
+			auto& F = Fields();
+			if (!F.id || !F.type || !F.begin || !F.end || !F.dispEnd) return;
 			++*count;
 			char buf[320];
 			snprintf(buf, sizeof(buf),
 				"MstEvent id=%d type=%d begin=%llu end=%llu displayEnd=%llu",
-				Int(item, "get_Id"), Int(item, "get_EventType"),
-				(unsigned long long)RawGetter(MstEvent_get_BeginDate_orig, "get_BeginDate", item),
-				(unsigned long long)RawGetter(MstEvent_get_EndDate_orig, "get_EndDate", item),
-				(unsigned long long)RawGetter(MstEvent_get_DisplayEndDate_orig, "get_DisplayEndDate", item));
+				il2cpp_symbols::read_field<int>(item, F.id),
+				il2cpp_symbols::read_field<int>(item, F.type),
+				(unsigned long long)il2cpp_symbols::read_field<uint64_t>(item, F.begin),
+				(unsigned long long)il2cpp_symbols::read_field<uint64_t>(item, F.end),
+				(unsigned long long)il2cpp_symbols::read_field<uint64_t>(item, F.dispEnd));
 			DumpLine(buf);
+		}
+
+		bool Contains(const char* hay, const char* needle) {
+			return hay && strstr(hay, needle) != nullptr;
+		}
+
+		// walkers: the container class is decided from its own name, then the
+		// backing fields are read directly (List`1 / Dictionary`2 / SortedList`2 /
+		// array).  Element stride assumes the standard IL2CPP x64 layout.
+		void DumpListLike(void* list, int* n, const char* itemsName, const char* sizeName) {
+			auto arr = ReadPtr(list, itemsName);
+			int size = ReadInt(list, sizeName);
+			if (size < 0) size = ArrayLength(arr);
+			if (size > 4000) size = 4000;
+			DumpLine("  (list " + CN(list) + " size=" + std::to_string(size) + ")");
+			if (!arr || !PlausiblePtr((uint64_t)arr)) { DumpLine("  (items array missing)"); return; }
+			for (int i = 0; i < size; i++) DumpRow(*(void**)ArrayElem(arr, i, 8), n);
+		}
+
+		void DumpDictionary(void* dict, int* n) {
+			auto entries = ReadPtr(dict, "_entries");
+			int count = ReadInt(dict, "_count");
+			if (count < 0) count = ArrayLength(entries);
+			if (count > 1000000) count = 1000000;
+			DumpLine("  (dict " + CN(dict) + " count=" + std::to_string(count) + ")");
+			if (!entries || !PlausiblePtr((uint64_t)entries)) { DumpLine("  (entries array missing)"); return; }
+			for (int i = 0; i < count; i++) {
+				uintptr_t e = ArrayElem(entries, i, 24);   // Entry<int, MstEvent>
+				if (*(int*)e < 0) continue;               // free slot
+				DumpRow(*(void**)(e + 16), n);
+			}
+		}
+
+		void DumpSortedList(void* sl, int* n) {
+			auto values = ReadPtr(sl, "values");
+			int size = ReadInt(sl, "_size");
+			if (size < 0) size = ArrayLength(values);
+			if (size > 4000) size = 4000;
+			DumpLine("  (sortedlist " + CN(sl) + " size=" + std::to_string(size) + ")");
+			if (!values || !PlausiblePtr((uint64_t)values)) { DumpLine("  (values array missing)"); return; }
+			for (int i = 0; i < size; i++) DumpRow(*(void**)ArrayElem(values, i, 8), n);
+		}
+
+		void DumpArray(void* arr, int* n) {
+			int len = ArrayLength(arr);
+			DumpLine("  (array len=" + std::to_string(len) + ")");
+			for (int i = 0; i < len && i < 4000; i++) DumpRow(*(void**)ArrayElem(arr, i, 8), n);
+		}
+
+		// fallback: storage class unknown - probe the usual backing field names
+		// and report what exists so the next build can target it exactly
+		void ProbeUnknown(void* container, int* n) {
+			(void)n;
+			auto k = ClassOf(container);
+			DumpLine("  (unknown container " + CN(container) + " - probing fields)");
+			static const char* kProbe[] = { "_items", "items", "_values", "values", "_list", "list", "_entries", "entries", "_array", "array", "_data", "data" };
+			for (const char* fn : kProbe) {
+				auto fi = Field(k, fn);
+				if (!fi) continue;
+				DumpLine(std::string("    field ") + fn + " offset=" + std::to_string(fi->offset));
+			}
 		}
 
 		void TryDumpTable() {
@@ -1001,6 +1003,7 @@ namespace
 			if ((++frame % 60) != 1) return;
 			if (++tries > 180) { finished = true; DumpLine("(gave up after 180 attempts)"); return; }
 
+			// the only managed calls kept: two getters proven safe in v11/v12
 			static auto method_get_Instance = il2cpp_symbols_logged::get_method(
 				"PRISM.Adapters.dll", "PRISM.Adapters", "IAdapterLocator", "get_Instance", 0);
 			if (!method_get_Instance || !method_get_Instance->methodPointer) return;
@@ -1015,75 +1018,33 @@ namespace
 			static auto klass_MasterData = il2cpp_symbols_logged::get_class(
 				"PRISM.Definitions.dll", "PRISM.Definitions", "MasterData");
 			if (!klass_MasterData) return;
+			auto fi = il2cpp_symbols_logged::il2cpp_class_get_field_from_name(klass_MasterData, "Events");
+			if (!fi) { DumpLine("MasterData.Events field not found"); return; }
+			auto table = il2cpp_symbols::read_field<Il2CppObject*>(masterData, fi);
+			if (!table) { DumpLine("MasterData.Events = null"); return; }
+			DumpLine("MasterData.Events -> " + CN(table) + " @ " + PtrStr(table));
 
-			static const char* kFields[] = { "Events", "EventMasters", "MstEvents" };
-			for (const char* fn : kFields) {
-				auto fi = il2cpp_symbols_logged::il2cpp_class_get_field_from_name(klass_MasterData, fn);
-				if (!fi) continue;
-				auto table = il2cpp_symbols::read_field<Il2CppObject*>(masterData, fi);
-				if (!table) { DumpLine(std::string("MasterData.") + fn + " = null"); continue; }
-				auto tableK = il2cpp_symbols::get_class_from_instance(table);
-				const char* tcn = tableK ? il2cpp_class_get_name(tableK) : nullptr;
-				DumpLine(std::string("MasterData.") + fn + " -> " + (tcn ? tcn : "?"));
-				int n = 0;
-				auto getEnum = tableK ? il2cpp_class_get_method_from_name(tableK, "GetEnumerator", 0) : nullptr;
-				if (getEnum && getEnum->methodPointer) {
-					il2cpp_symbols::iterate_IEnumerable<Il2CppObject*>(table, [&](Il2CppObject* item) {
-						DumpRow(item, &n);
-					});
-				}
-				else {
-					auto getItem = tableK ? il2cpp_class_get_method_from_name(tableK, "get_Item", 1) : nullptr;
-					auto getCount = tableK ? il2cpp_class_get_method_from_name(tableK, "get_Count", 0) : nullptr;
-					if (getItem && getItem->methodPointer && getCount && getCount->methodPointer) {
-						int cnt = reinterpret_cast<int(*)(void*)>(getCount->methodPointer)(table);
-						if (cnt > 4000) cnt = 4000;
-						for (int i = 0; i < cnt; i++) {
-							DumpRow(reinterpret_cast<Il2CppObject*(*)(void*, int)>(getItem->methodPointer)(table, i), &n);
-						}
-					}
-					else {
-						DumpLine("  (not enumerable - no GetEnumerator/get_Item)");
-					}
-				}
-				DumpLine(std::string("  entries=") + std::to_string(n));
-				if (n > 0) { finished = true; return; }
-			}
+			// SortedMasterTable`2 itself has no fields - "data" lives on the base
+			// MasterTable`1, which il2cpp_class_get_field_from_name also searches
+			auto data = ReadPtr(table, "data");
+			DumpLine("  data=" + PtrStr(data));
+			if (!data || !PlausiblePtr((uint64_t)data)) return;
+			const char* dcn = ClassNameOf(data);
+			DumpLine(std::string("  data class=") + (dcn ? dcn : "?"));
+			int n = 0;
+			if (Contains(dcn, "List`1")) DumpListLike(data, &n, "_items", "_size");
+			else if (Contains(dcn, "Dictionary`2")) DumpDictionary(data, &n);
+			else if (Contains(dcn, "SortedList`2")) DumpSortedList(data, &n);
+			else if (Contains(dcn, "[]")) DumpArray(data, &n);
+			else ProbeUnknown(data, &n);
+			DumpLine("  entries=" + std::to_string(n));
+			if (n > 0) finished = true;
 		}
 	}
 
-	// READ-ONLY hooks (v12): log every distinct call with its caller, then hand
-	// back a far future date when the patch is enabled (return-value replacement
-	// only; nothing is ever written to memory).  DisplayEndDate is included
-	// because that is the property the UI is most likely to read.
-	uint64_t MstEvent_get_EndDate_hook(void* self) {
-		const uint64_t real = HOOK_CAST_CALL(uint64_t, MstEvent_get_EndDate)(self);
-		const uintptr_t pc = (uintptr_t)_ReturnAddress();
-		EventDates::LogCall("end", self, real, pc);
-		EventDates::Report(self, "end", real);
-		return EventDates::Override(real);
-	}
-
-	uint64_t MstEvent_get_DisplayEndDate_hook(void* self) {
-		const uint64_t real = HOOK_CAST_CALL(uint64_t, MstEvent_get_DisplayEndDate)(self);
-		const uintptr_t pc = (uintptr_t)_ReturnAddress();
-		EventDates::LogCall("dispEnd", self, real, pc);
-		EventDates::Report(self, "dispEnd", real);
-		return EventDates::Override(real);
-	}
-
-	uint64_t MstEvent_get_BeginDate_hook(void* self) {
-		const uint64_t real = HOOK_CAST_CALL(uint64_t, MstEvent_get_BeginDate)(self);
-		EventDates::LogCall("begin", self, real, (uintptr_t)_ReturnAddress());
-		EventDates::Report(self, "begin", real);
-		return real;  // log only - begin dates must not be rewritten
-	}
-
-	int MstEvent_get_EventType_hook(void* self) {
-		const int v = HOOK_CAST_CALL(int, MstEvent_get_EventType)(self);
-		EventDates::LogCall("type", self, (uint64_t)(int64_t)v, (uintptr_t)_ReturnAddress());
-		return v;
-	}
+	// v13: the four MstEvent getter hooks were removed - those addresses are
+	// ICF-shared with unrelated methods and hooking them crashed the game
+	// (GameAssembly.dll+0x20af266).  All date inspection is pure field reads.
 
 	HOOK_ORIG_TYPE DioramaProductViewModel_IsLocked_orig;
 	bool DioramaProductViewModel_IsLocked_hook(void* self) {
@@ -2871,7 +2832,7 @@ namespace
 			printf("MainThreadDispatcher Error: %s\n", ex.what());
 		}
 		OverrideAllTransforms();
-		EventDates::TryDumpTable();  // [PATCH] v12 - one-shot MasterData.Events dump
+		EventDates::TryDumpTable();  // [PATCH] v13 - one-shot pure-read MasterData.Events dump
 		return HOOK_CAST_CALL(void, MainThreadDispatcher_LateUpdate)(_this, method);
 	}
 
@@ -4723,19 +4684,17 @@ namespace
 		ADD_HOOK_ADDR(PRISM.Definitions.dll, PRISM.Definitions, MstProduceIdol, set_Id, 1);
 		ADD_HOOK_ADDR(PRISM.Definitions.dll, PRISM.Definitions, MstProduceIdol, set_MstIdolId, 1);
 
-		// permanent limited-time events: replace the value returned by
-		// MstEvent.get_EndDate / get_DisplayEndDate (READ-ONLY - see the
-		// EventDates note above).  mst-events.txt records the real dates;
-		// "extendEventDates" in scsp-config.json turns the override on.
-		// v12 also logs every distinct getter call with its caller
-		// (mst-events-calls.txt) and writes an install report (runway-diag.txt)
-		// so a silent resolution failure can be told apart from "the getter is
-		// simply never called".
+		// permanent limited-time events: v13 diagnostic only.  The four getter
+		// hooks were removed (their addresses are ICF-shared with unrelated
+		// methods - hooking them crashed the game).  This block installs
+		// nothing; it only reports the method addresses and backing field
+		// offsets to runway-diag.txt.  The real stored dates come from
+		// EventDates::TryDumpTable (pure field reads, mst-events-table.txt).
 		{
 			auto k = il2cpp_symbols_logged::get_class("PRISM.Definitions.dll", "PRISM.Definitions", "MstEvent");
 			std::ofstream d("runway-diag.txt", std::ios::app);
 			if (d.is_open()) {
-				d << "=== v12 EventDates install (pid " << GetCurrentProcessId() << ") ===\n";
+				d << "=== v13 EventDates diag (pid " << GetCurrentProcessId() << ") - no hooks ===\n";
 				d << "MstEvent klass=0x" << std::hex << (uintptr_t)k << std::dec;
 				if (k) {
 					const char* kn = il2cpp_class_get_name(k);
@@ -4744,36 +4703,43 @@ namespace
 				}
 				d << "\n";
 			}
-			auto installOne = [&](const char* name, int argc, void* hookFn, void** origOut) {
+			auto reportOne = [&](const char* name, int argc) {
 				auto m = k ? il2cpp_class_get_method_from_name(k, name, argc) : nullptr;
-				if (d.is_open()) {
-					d << name << "(" << argc << ")";
-					if (m) {
-						d << " mi=0x" << std::hex << (uintptr_t)m
-							<< " ptr=0x" << (uintptr_t)m->methodPointer << std::dec;
-						auto rt = il2cpp_method_get_return_type(m);
-						if (rt) {
-							const char* tn = il2cpp_type_get_name(rt);
-							if (tn) d << " ret=" << tn;
-						}
+				if (!d.is_open()) return;
+				d << name << "(" << argc << ")";
+				if (m) {
+					d << " mi=0x" << std::hex << (uintptr_t)m
+						<< " ptr=0x" << (uintptr_t)m->methodPointer << std::dec;
+					auto rt = il2cpp_method_get_return_type(m);
+					if (rt) {
+						const char* tn = il2cpp_type_get_name(rt);
+						if (tn) d << " ret=" << tn;
 					}
-					else d << " (not found)";
+				}
+				else d << " (not found)";
+				d << "\n";
+			};
+			reportOne("get_Id", 0);
+			reportOne("get_EventType", 0);
+			reportOne("get_BeginDate", 0);
+			reportOne("get_EndDate", 0);
+			reportOne("get_DisplayEndDate", 0);
+			reportOne("set_DisplayEndDate", 1);
+			reportOne("DisplayEndDate", 1);
+			static const char* kBacking[] = {
+				"<Id>k__BackingField", "<EventType>k__BackingField",
+				"<BeginDate>k__BackingField", "<EndDate>k__BackingField",
+				"<DisplayEndDate>k__BackingField" };
+			if (d.is_open() && k) {
+				for (const char* bn : kBacking) {
+					auto fi = il2cpp_symbols_logged::il2cpp_class_get_field_from_name(k, bn);
+					d << "field " << bn << ": ";
+					if (fi) d << "offset=" << fi->offset;
+					else d << "(not found)";
 					d << "\n";
 				}
-				if (m && m->methodPointer && hookFn) {
-					auto s1 = MH_CreateHook((void*)m->methodPointer, hookFn, origOut);
-					auto s2 = MH_EnableHook((void*)m->methodPointer);
-					if (d.is_open()) d << "  MH: " << MH_StatusToString(s1) << " / " << MH_StatusToString(s2) << "\n";
-				}
-			};
-			installOne("get_EndDate", 0, (void*)MstEvent_get_EndDate_hook, (void**)&MstEvent_get_EndDate_orig);
-			installOne("get_DisplayEndDate", 0, (void*)MstEvent_get_DisplayEndDate_hook, (void**)&MstEvent_get_DisplayEndDate_orig);
-			installOne("get_BeginDate", 0, (void*)MstEvent_get_BeginDate_hook, (void**)&MstEvent_get_BeginDate_orig);
-			installOne("get_EventType", 0, (void*)MstEvent_get_EventType_hook, (void**)&MstEvent_get_EventType_orig);
-			installOne("get_Id", 0, nullptr, nullptr);
-			installOne("set_DisplayEndDate", 1, nullptr, nullptr);
-			installOne("DisplayEndDate", 1, nullptr, nullptr);
-			if (d.is_open()) d.flush();
+				d.flush();
+			}
 		}
 
 		tools::AddNetworkingHooks();
