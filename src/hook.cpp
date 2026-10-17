@@ -811,6 +811,16 @@ namespace
 	//   v13 therefore installs NOTHING and calls NOTHING: it reads the real
 	//   stored values straight out of MasterData.Events by field offset
 	//   (mst-events-table.txt) and writes an install report (runway-diag.txt).
+	//
+	//   v14 (the real fix, still NO hooks): once per session the newest
+	//   Shiny Runway row (EventType==7, highest Id) is overwritten in the
+	//   live master - EndDate and DisplayEndDate := 2099-12-31 23:59:59,
+	//   BeginDate stays 2026-09-26 20:30 (already in the past), so the
+	//   event window permanently contains "now" and the event can never be
+	//   over.  The write targets the exact FieldInfo offset of the row that
+	//   was just verified to be a real MstEvent - no hook, no managed call,
+	//   no other object is touched.  The result is logged to
+	//   mst-events-patch.txt (old value -> new value, read back).
 	// =====================================================================
 
 	namespace EventDates {
@@ -901,6 +911,65 @@ namespace
 			return f;
 		}
 
+		// ---------------- v14 "never ends" patch (field write only) ----------------
+		// 2099-12-31 23:59:59 UTC as a System.DateTime: ticks since 0001-01-01
+		// = 662380415990000000, Kind=Utc sets bit 62.
+		constexpr uint64_t kNeverEnds = 5274066434417387904ULL;
+
+		void* g_bestRunwayRow = nullptr;  // newest EventType==7 row seen
+		int   g_bestRunwayId  = -1;
+
+		void PatchLine(const std::string& line) {
+			std::lock_guard<std::mutex> lk(Mtx());
+			std::ofstream f("mst-events-patch.txt", std::ios::app);
+			if (!f.is_open()) return;
+			f << line << "\n";
+			f.flush();
+		}
+
+		bool LooksLikeDateTime(uint64_t raw) {
+			uint64_t ticks = raw & 0x3FFFFFFFFFFFFFFFULL;
+			return ticks >= 630822816000000000ULL   // 2000-01-01
+				&& ticks <= 662380415990000000ULL;  // 2099-12-31
+		}
+
+		// called once, right after the master walk has seen every row
+		void ApplyPatch() {
+			static bool done = false;
+			if (done) return;
+			done = true;
+			if (!g_extend_event_dates) {
+				PatchLine("extendEventDates=false - master untouched (diagnostic run)");
+				return;
+			}
+			if (!g_bestRunwayRow || g_bestRunwayId < 0) {
+				PatchLine("no EventType==7 row found - master untouched");
+				return;
+			}
+			auto& F = Fields();
+			if (!F.end || !F.dispEnd) {
+				PatchLine("MstEvent date fields unresolved - master untouched");
+				return;
+			}
+			uint64_t oldEnd = il2cpp_symbols::read_field<uint64_t>(g_bestRunwayRow, F.end);
+			uint64_t oldDisp = il2cpp_symbols::read_field<uint64_t>(g_bestRunwayRow, F.dispEnd);
+			// sanity: the old values must look like real DateTimes (2000..2099),
+			// otherwise this row is not what we think it is - do not touch it
+			if (!LooksLikeDateTime(oldEnd) || !LooksLikeDateTime(oldDisp)) {
+				PatchLine("row id=" + std::to_string(g_bestRunwayId)
+					+ " has unexpected date values - master untouched");
+				return;
+			}
+			il2cpp_symbols::write_field<uint64_t>(g_bestRunwayRow, F.end, kNeverEnds);
+			il2cpp_symbols::write_field<uint64_t>(g_bestRunwayRow, F.dispEnd, kNeverEnds);
+			uint64_t newEnd = il2cpp_symbols::read_field<uint64_t>(g_bestRunwayRow, F.end);
+			uint64_t newDisp = il2cpp_symbols::read_field<uint64_t>(g_bestRunwayRow, F.dispEnd);
+			PatchLine("PATCHED id=" + std::to_string(g_bestRunwayId)
+				+ " row=" + PtrStr(g_bestRunwayRow)
+				+ " end " + std::to_string(oldEnd) + " -> " + std::to_string(newEnd)
+				+ " | displayEnd " + std::to_string(oldDisp) + " -> " + std::to_string(newDisp));
+		}
+
 		// (v13: no call logging, no caller resolution, no managed method calls -
 		// all values are read straight from the row's fields.)
 
@@ -923,11 +992,16 @@ namespace
 			auto& F = Fields();
 			if (!F.id || !F.type || !F.begin || !F.end || !F.dispEnd) return;
 			++*count;
+			int idv = il2cpp_symbols::read_field<int>(item, F.id);
+			int tv = il2cpp_symbols::read_field<int>(item, F.type);
+			if (tv == 7 && idv > g_bestRunwayId) {
+				g_bestRunwayId = idv;          // newest Shiny Runway row (v14 target)
+				g_bestRunwayRow = item;
+			}
 			char buf[320];
 			snprintf(buf, sizeof(buf),
 				"MstEvent id=%d type=%d begin=%llu end=%llu displayEnd=%llu",
-				il2cpp_symbols::read_field<int>(item, F.id),
-				il2cpp_symbols::read_field<int>(item, F.type),
+				idv, tv,
 				(unsigned long long)il2cpp_symbols::read_field<uint64_t>(item, F.begin),
 				(unsigned long long)il2cpp_symbols::read_field<uint64_t>(item, F.end),
 				(unsigned long long)il2cpp_symbols::read_field<uint64_t>(item, F.dispEnd));
@@ -1038,7 +1112,10 @@ namespace
 			else if (Contains(dcn, "[]")) DumpArray(data, &n);
 			else ProbeUnknown(data, &n);
 			DumpLine("  entries=" + std::to_string(n));
-			if (n > 0) finished = true;
+			if (n > 0) {
+				finished = true;
+				ApplyPatch();   // v14: overwrite the newest runway row's dates
+			}
 		}
 	}
 
@@ -2832,7 +2909,7 @@ namespace
 			printf("MainThreadDispatcher Error: %s\n", ex.what());
 		}
 		OverrideAllTransforms();
-		EventDates::TryDumpTable();  // [PATCH] v13 - one-shot pure-read MasterData.Events dump
+		EventDates::TryDumpTable();  // [PATCH] v14 - master dump + one-shot "never ends" date patch
 		return HOOK_CAST_CALL(void, MainThreadDispatcher_LateUpdate)(_this, method);
 	}
 
@@ -4684,17 +4761,18 @@ namespace
 		ADD_HOOK_ADDR(PRISM.Definitions.dll, PRISM.Definitions, MstProduceIdol, set_Id, 1);
 		ADD_HOOK_ADDR(PRISM.Definitions.dll, PRISM.Definitions, MstProduceIdol, set_MstIdolId, 1);
 
-		// permanent limited-time events: v13 diagnostic only.  The four getter
-		// hooks were removed (their addresses are ICF-shared with unrelated
-		// methods - hooking them crashed the game).  This block installs
-		// nothing; it only reports the method addresses and backing field
-		// offsets to runway-diag.txt.  The real stored dates come from
-		// EventDates::TryDumpTable (pure field reads, mst-events-table.txt).
+		// permanent limited-time events: v14 - one-shot field WRITE on the
+		// newest Shiny Runway row (see EventDates::ApplyPatch).  No hooks:
+		// the four getter hooks were removed in v13 (their addresses are
+		// ICF-shared with unrelated methods - hooking them crashed the game).
+		// This block still installs nothing; it only reports the method
+		// addresses and backing field offsets to runway-diag.txt.  The
+		// applied dates are logged to mst-events-patch.txt.
 		{
 			auto k = il2cpp_symbols_logged::get_class("PRISM.Definitions.dll", "PRISM.Definitions", "MstEvent");
 			std::ofstream d("runway-diag.txt", std::ios::app);
 			if (d.is_open()) {
-				d << "=== v13 EventDates diag (pid " << GetCurrentProcessId() << ") - no hooks ===\n";
+				d << "=== v14 EventDates diag (pid " << GetCurrentProcessId() << ") - no hooks, write patch in EventDates ===\n";
 				d << "MstEvent klass=0x" << std::hex << (uintptr_t)k << std::dec;
 				if (k) {
 					const char* kn = il2cpp_class_get_name(k);
