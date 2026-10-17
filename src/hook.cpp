@@ -2882,6 +2882,356 @@ namespace
 			matchedTypes, writtenMethods);
 	}
 
+	// ============================================================================
+	// [DIAG] v15 - PRISM view-connector / viewMapping diagnostics (read-only).
+	// ErrorCode[8E0AC0DA] == CRC32("IRunwayUnitConfirmationConnector"): produced by
+	// BootMenuScene._toErrorCode() when a view jump cannot be resolved. These hooks
+	// only log state (viewMapping content, jump targets, connector lifetime,
+	// exceptions); they never modify game data.
+	// ============================================================================
+	namespace ViewDiag {
+		void* g_bootMenuScene = nullptr;
+
+		std::string timestamp() {
+			const auto ms = GetTickCount64();
+			return "[" + std::to_string((unsigned long long)(ms / 1000)) + "." + std::to_string((unsigned long long)(ms % 1000)) + "]";
+		}
+
+		std::string ptr_str(const void* p) {
+			return std::format("{:p}", (void*)p);
+		}
+
+		std::string il2cpp_to_utf8(Il2CppString* s) {
+			if (!s) return "(null)";
+			try {
+				return utility::conversions::to_utf8string(s->toWstring());
+			}
+			catch (...) {
+				return "(convert-error)";
+			}
+		}
+
+		void appendLog(const char* fileName, const std::string& line) {
+			try {
+				std::ofstream f(fileName, std::ios::app);
+				if (f.is_open()) f << line << "\n";
+			}
+			catch (...) {}
+		}
+
+		void* find_class_anywhere(const char* namespaze, const char* className) {
+			size_t count = 0;
+			auto** assemblies = il2cpp_domain_get_assemblies(il2cpp_domain_get(), &count);
+			for (size_t i = 0; assemblies && i < count; ++i) {
+				auto* image = il2cpp_assembly_get_image((void*)assemblies[i]);
+				if (!image) continue;
+				auto* klass = il2cpp_class_from_name(image, namespaze, className);
+				if (klass) return klass;
+			}
+			return nullptr;
+		}
+
+		void* find_method_anywhere(const char* namespaze, const char* className, const char* methodName, int paramCount) {
+			auto* klass = find_class_anywhere(namespaze, className);
+			if (!klass) return nullptr;
+			auto* method = il2cpp_class_get_method_from_name(klass, methodName, paramCount);
+			return method ? (void*)method->methodPointer : nullptr;
+		}
+
+		void* find_nested_move_next(const char* namespaze, const char* outerClassName, const char* nestedClassName) {
+			auto* outer = (Il2CppClass*)find_class_anywhere(namespaze, outerClassName);
+			if (!outer) return nullptr;
+			auto* nested = il2cpp_symbols::get_nested_class(outer, nestedClassName);
+			if (!nested) return nullptr;
+			auto* method = il2cpp_class_get_method_from_name(nested, "MoveNext", 0);
+			return method ? (void*)method->methodPointer : nullptr;
+		}
+
+		std::string reflection_type_name(Il2CppReflectionType* type) {
+			if (!type) return "(null-type)";
+			try {
+				auto* klass = il2cpp_class_from_system_type(type);
+				if (!klass) return "(unresolved-type)";
+				const char* ns = il2cpp_class_get_namespace(klass);
+				const char* name = il2cpp_class_get_name(klass);
+				std::string result;
+				if (ns && *ns) { result += ns; result += "."; }
+				result += (name ? name : "?");
+				return result;
+			}
+			catch (...) {
+				return "(type-error)";
+			}
+		}
+
+		void DumpViewMapping(const char* reason) {
+			const std::string head = timestamp() + " dump(" + std::string(reason) + ")";
+			try {
+				if (!g_bootMenuScene) {
+					appendLog("viewmap-dump.txt", head + " SKIP: BootMenuScene instance not captured yet");
+					return;
+				}
+				auto* scene_klass = find_class_anywhere("PRISM.Boot", "BootMenuScene");
+				if (!scene_klass) { appendLog("viewmap-dump.txt", head + " SKIP: BootMenuScene class not found"); return; }
+				auto* mapping_field = il2cpp_class_get_field_from_name(scene_klass, "viewMapping");
+				if (!mapping_field) { appendLog("viewmap-dump.txt", head + " SKIP: viewMapping field not found"); return; }
+				auto* dict = il2cpp_symbols::read_field<Il2CppObject*>(g_bootMenuScene, mapping_field);
+				if (!dict) { appendLog("viewmap-dump.txt", head + " viewMapping=NULL"); return; }
+
+				auto* dict_klass = il2cpp_symbols::get_system_class_from_reflection_type_str(
+					"System.Collections.Generic.Dictionary`2[System.String, PRISM.ViewBundle]");
+				if (!dict_klass) { appendLog("viewmap-dump.txt", head + " SKIP: Dictionary<string,ViewBundle> type unresolved"); return; }
+
+				auto* entries_field = il2cpp_class_get_field_from_name(dict_klass, "_entries");
+				auto* count_field = il2cpp_class_get_field_from_name(dict_klass, "_count");
+				auto* entry_klass = (void*)il2cpp_symbols::get_nested_class((Il2CppClass*)dict_klass, "Entry");
+				auto* key_field = entry_klass ? il2cpp_class_get_field_from_name(entry_klass, "key") : nullptr;
+				auto* value_field = entry_klass ? il2cpp_class_get_field_from_name(entry_klass, "value") : nullptr;
+				auto* bundle_klass = find_class_anywhere("PRISM", "ViewBundle");
+				auto* b_typeName_field = bundle_klass ? il2cpp_class_get_field_from_name(bundle_klass, "typeName") : nullptr;
+				auto* b_reference_field = bundle_klass ? il2cpp_class_get_field_from_name(bundle_klass, "reference") : nullptr;
+				auto* b_tags_field = bundle_klass ? il2cpp_class_get_field_from_name(bundle_klass, "tags") : nullptr;
+
+				if (!entries_field || !count_field) {
+					appendLog("viewmap-dump.txt", head + " SKIP: dictionary internals unresolved");
+					return;
+				}
+
+				// Entry<string,ViewBundle> layout: hashCode@0, next@4, key@8, value@0x10.
+				int key_off = 0x8;
+				int value_off = 0x10;
+				if (key_field && value_field) {
+					key_off = key_field->offset;
+					value_off = value_field->offset;
+				}
+
+				auto* entries = il2cpp_symbols::read_field<Il2CppObject*>(dict, entries_field);
+				const int count = il2cpp_symbols::read_field<int>(dict, count_field);
+				const int stride = value_off + (int)sizeof(void*);
+
+				std::ofstream f("viewmap-dump.txt", std::ios::app);
+				if (!f.is_open()) return;
+				f << head << " COUNT=" << count << "\n";
+				if (entries) {
+					for (int i = 0; i < count; ++i) {
+						const char* entry = il2cpp_array_addr_with_size(entries, stride, i);
+						auto* key = *(Il2CppString**)(entry + key_off);
+						auto* bundle = *(void**)(entry + value_off);
+						f << "  [" << i << "] " << il2cpp_to_utf8(key);
+						if (bundle && b_typeName_field) {
+							auto* typeName = il2cpp_symbols::read_field<Il2CppString*>(bundle, b_typeName_field);
+							auto* reference = b_reference_field ? il2cpp_symbols::read_field<Il2CppString*>(bundle, b_reference_field) : nullptr;
+							f << "  typeName=" << il2cpp_to_utf8(typeName) << "  ref=" << il2cpp_to_utf8(reference);
+							if (b_tags_field) {
+								auto* tags = il2cpp_symbols::read_field<Il2CppObject*>(bundle, b_tags_field);
+								if (tags) {
+									const int tagCount = *(int*)((char*)tags + 0x18);
+									f << "  tags=[";
+									for (int t = 0; t < tagCount && t < 16; ++t) {
+										auto* tag = *(Il2CppString**)il2cpp_array_addr_with_size(tags, (int)sizeof(void*), t);
+										if (t) f << ",";
+										f << il2cpp_to_utf8(tag);
+									}
+									f << "]";
+								}
+							}
+						}
+						else if (bundle) {
+							f << "  (ViewBundle fields unresolved, obj=" << ptr_str(bundle) << ")";
+						}
+						f << "\n";
+					}
+				}
+				f.close();
+			}
+			catch (...) {
+				appendLog("viewmap-dump.txt", head + " EXCEPTION during dump");
+			}
+		}
+
+		HOOK_ORIG_TYPE BootMenuScene_Start_MoveNext_orig;
+		void BootMenuScene_Start_MoveNext_hook(void* _this) {
+			try {
+				if (_this && !g_bootMenuScene) {
+					auto* scene = *(void**)((char*)_this + 0x10);
+					if (scene) {
+						g_bootMenuScene = scene;
+						appendLog("viewmap-dump.txt", timestamp() + " BootMenuScene instance captured from <Start>d__0.MoveNext obj=" + ptr_str(scene));
+					}
+				}
+			}
+			catch (...) {}
+			return HOOK_CAST_CALL(void, BootMenuScene_Start_MoveNext)(_this);
+		}
+
+		HOOK_ORIG_TYPE BootMenuScene_SelectView_MoveNext_orig;
+		void BootMenuScene_SelectView_MoveNext_hook(void* _this) {
+			try {
+				if (_this) {
+					const int state = *(int*)((char*)_this + 0x0);
+					auto* scene = *(void**)((char*)_this + 0x20);
+					if (scene && !g_bootMenuScene) g_bootMenuScene = scene;
+					if (state == 0) {
+						auto* viewType = *(Il2CppReflectionType**)((char*)_this + 0x28);
+						appendLog("view-select-log.txt", timestamp() + " _selectViewAsync viewType=" + reflection_type_name(viewType));
+					}
+				}
+			}
+			catch (...) {}
+			return HOOK_CAST_CALL(void, BootMenuScene_SelectView_MoveNext)(_this);
+		}
+
+		HOOK_ORIG_TYPE BootMenuScene_setupView_orig;
+		int BootMenuScene_setupView_hook(void* _this) {
+			try {
+				if (_this && !g_bootMenuScene) {
+					g_bootMenuScene = _this;
+					appendLog("viewmap-dump.txt", timestamp() + " BootMenuScene instance captured from _setupView obj=" + ptr_str(_this));
+				}
+			}
+			catch (...) {}
+			return HOOK_CAST_CALL(int, BootMenuScene_setupView)(_this);
+		}
+
+		HOOK_ORIG_TYPE BootMenuScene_getViewBundles_orig;
+		void* BootMenuScene_getViewBundles_hook(void* _this) {
+			try {
+				if (_this && !g_bootMenuScene) g_bootMenuScene = _this;
+				appendLog("viewmap-dump.txt", timestamp() + " _getViewBundles called");
+			}
+			catch (...) {}
+			return HOOK_CAST_CALL(void*, BootMenuScene_getViewBundles)(_this);
+		}
+
+		HOOK_ORIG_TYPE BootMenuScene_toErrorCode_orig;
+		Il2CppString* BootMenuScene_toErrorCode_hook(Il2CppString* viewType) {
+			try {
+				appendLog("view-error-log.txt", timestamp() + " _toErrorCode viewType=" + il2cpp_to_utf8(viewType));
+				DumpViewMapping("toErrorCode");
+			}
+			catch (...) {}
+			return HOOK_CAST_CALL(Il2CppString*, BootMenuScene_toErrorCode)(viewType);
+		}
+
+		HOOK_ORIG_TYPE BootMenuScene_onViewErrorAsync_orig;
+		void BootMenuScene_onViewErrorAsync_hook(void* retBuf, void* exception) {
+			try {
+				std::string detail = "(null)";
+				if (exception) {
+					auto* klass = il2cpp_symbols::get_class_from_instance(exception);
+					if (klass) {
+						const char* ns = il2cpp_class_get_namespace(klass);
+						const char* name = il2cpp_class_get_name(klass);
+						detail = std::string(ns ? ns : "") + "." + (name ? name : "?");
+						auto* toString = il2cpp_class_get_method_from_name(klass, "ToString", 0);
+						if (toString) {
+							auto fn = reinterpret_cast<Il2CppString* (*)(void*)>(toString->methodPointer);
+							detail += " msg=" + il2cpp_to_utf8(fn(exception));
+						}
+					}
+				}
+				appendLog("view-error-log.txt", timestamp() + " _onViewErrorAsync exception=" + detail);
+				DumpViewMapping("onViewError");
+			}
+			catch (...) {}
+			return HOOK_CAST_CALL(void, BootMenuScene_onViewErrorAsync)(retBuf, exception);
+		}
+
+		HOOK_ORIG_TYPE BootMenuScene_LoadViewAssetAsync_orig;
+		void BootMenuScene_LoadViewAssetAsync_hook(void* retBuf, void* _this, Il2CppString* viewName, void* resourceLoader) {
+			try {
+				appendLog("view-asset-log.txt", timestamp() + " LoadViewAssetAsync viewName=" + il2cpp_to_utf8(viewName));
+			}
+			catch (...) {}
+			return HOOK_CAST_CALL(void, BootMenuScene_LoadViewAssetAsync)(retBuf, _this, viewName, resourceLoader);
+		}
+
+		HOOK_ORIG_TYPE ViewManager_JumpView_orig;
+		void ViewManager_JumpView_hook(void* _this, Il2CppReflectionType* viewType, bool withFade, void* param, int stackOperation) {
+			try {
+				appendLog("view-jump-log.txt", timestamp() + " JumpView viewType=" + reflection_type_name(viewType)
+					+ " withFade=" + (withFade ? "1" : "0") + " stackOperation=" + std::to_string(stackOperation));
+			}
+			catch (...) {}
+			return HOOK_CAST_CALL(void, ViewManager_JumpView)(_this, viewType, withFade, param, stackOperation);
+		}
+
+		HOOK_ORIG_TYPE ViewManager_JumpViewAsync_orig;
+		void ViewManager_JumpViewAsync_hook(void* retBuf, void* _this, Il2CppReflectionType* viewType, bool withFade, void* param, int stackOperation) {
+			try {
+				appendLog("view-jump-log.txt", timestamp() + " JumpViewAsync viewType=" + reflection_type_name(viewType)
+					+ " withFade=" + (withFade ? "1" : "0") + " stackOperation=" + std::to_string(stackOperation));
+			}
+			catch (...) {}
+			return HOOK_CAST_CALL(void, ViewManager_JumpViewAsync)(retBuf, _this, viewType, withFade, param, stackOperation);
+		}
+
+		HOOK_ORIG_TYPE RunwayEventTopConnector_ctor_orig;
+		void RunwayEventTopConnector_ctor_hook(void* _this) {
+			try { appendLog("runway-connector-log.txt", timestamp() + " RunwayEventTopConnector..ctor obj=" + ptr_str(_this)); } catch (...) {}
+			return HOOK_CAST_CALL(void, RunwayEventTopConnector_ctor)(_this);
+		}
+
+		HOOK_ORIG_TYPE RunwayEventTopConnector_ParseFromLegacy_orig;
+		void* RunwayEventTopConnector_ParseFromLegacy_hook(void* _this, void* parameter) {
+			try { appendLog("runway-connector-log.txt", timestamp() + " RunwayEventTopConnector.ParseFromLegacy param=" + ptr_str(parameter)); } catch (...) {}
+			return HOOK_CAST_CALL(void*, RunwayEventTopConnector_ParseFromLegacy)(_this, parameter);
+		}
+
+		HOOK_ORIG_TYPE RunwayUnitConfirmationConnector_ctor_orig;
+		void RunwayUnitConfirmationConnector_ctor_hook(void* _this) {
+			try { appendLog("runway-connector-log.txt", timestamp() + " RunwayUnitConfirmationConnector..ctor obj=" + ptr_str(_this)); } catch (...) {}
+			return HOOK_CAST_CALL(void, RunwayUnitConfirmationConnector_ctor)(_this);
+		}
+
+		HOOK_ORIG_TYPE RunwayUnitConfirmationConnector_ParseFromLegacy_orig;
+		void* RunwayUnitConfirmationConnector_ParseFromLegacy_hook(void* _this, void* parameter) {
+			try { appendLog("runway-connector-log.txt", timestamp() + " RunwayUnitConfirmationConnector.ParseFromLegacy param=" + ptr_str(parameter)); } catch (...) {}
+			return HOOK_CAST_CALL(void*, RunwayUnitConfirmationConnector_ParseFromLegacy)(_this, parameter);
+		}
+
+		void Tick() {
+			static ULONGLONG startTick = 0;
+			static int stage = 0;
+			if (!startTick) startTick = GetTickCount64();
+			static const ULONGLONG thresholds[] = { 10000, 30000, 90000 };
+			if (stage < 3 && GetTickCount64() - startTick >= thresholds[stage]) {
+				DumpViewMapping(stage == 0 ? "T+10s" : (stage == 1 ? "T+30s" : "T+90s"));
+				++stage;
+			}
+		}
+
+		void InstallHooks() {
+			auto BootMenuScene_Start_MoveNext_addr = find_nested_move_next("PRISM.Boot", "BootMenuScene", "<Start>d__0");
+			auto BootMenuScene_SelectView_MoveNext_addr = find_nested_move_next("PRISM.Boot", "BootMenuScene", "<_selectViewAsync>d__5");
+			auto BootMenuScene_setupView_addr = find_method_anywhere("PRISM.Boot", "BootMenuScene", "_setupView", 0);
+			auto BootMenuScene_getViewBundles_addr = find_method_anywhere("PRISM.Boot", "BootMenuScene", "_getViewBundles", 0);
+			auto BootMenuScene_toErrorCode_addr = find_method_anywhere("PRISM.Boot", "BootMenuScene", "_toErrorCode", 1);
+			auto BootMenuScene_onViewErrorAsync_addr = find_method_anywhere("PRISM.Boot", "BootMenuScene", "_onViewErrorAsync", 1);
+			auto BootMenuScene_LoadViewAssetAsync_addr = find_method_anywhere("PRISM.Boot", "BootMenuScene", "LoadViewAssetAsync", 2);
+			auto ViewManager_JumpView_addr = find_method_anywhere("ENTERPRISE", "ViewManager", "JumpView", 4);
+			auto ViewManager_JumpViewAsync_addr = find_method_anywhere("ENTERPRISE", "ViewManager", "JumpViewAsync", 4);
+			auto RunwayEventTopConnector_ctor_addr = find_method_anywhere("PRISM.Interactions", "RunwayEventTopConnector", ".ctor", 0);
+			auto RunwayEventTopConnector_ParseFromLegacy_addr = find_method_anywhere("PRISM.Interactions", "RunwayEventTopConnector", "ParseFromLegacy", 1);
+			auto RunwayUnitConfirmationConnector_ctor_addr = find_method_anywhere("PRISM.Interactions", "RunwayUnitConfirmationConnector", ".ctor", 0);
+			auto RunwayUnitConfirmationConnector_ParseFromLegacy_addr = find_method_anywhere("PRISM.Interactions", "RunwayUnitConfirmationConnector", "ParseFromLegacy", 1);
+
+			ADD_HOOK_1(BootMenuScene_Start_MoveNext);
+			ADD_HOOK_1(BootMenuScene_SelectView_MoveNext);
+			ADD_HOOK_1(BootMenuScene_setupView);
+			ADD_HOOK_1(BootMenuScene_getViewBundles);
+			ADD_HOOK_1(BootMenuScene_toErrorCode);
+			ADD_HOOK_1(BootMenuScene_onViewErrorAsync);
+			ADD_HOOK_1(BootMenuScene_LoadViewAssetAsync);
+			ADD_HOOK_1(ViewManager_JumpView);
+			ADD_HOOK_1(ViewManager_JumpViewAsync);
+			ADD_HOOK_1(RunwayEventTopConnector_ctor);
+			ADD_HOOK_1(RunwayEventTopConnector_ParseFromLegacy);
+			ADD_HOOK_1(RunwayUnitConfirmationConnector_ctor);
+			ADD_HOOK_1(RunwayUnitConfirmationConnector_ParseFromLegacy);
+		}
+	}
+
 	void MainThreadDispatcher_LateUpdate_hook(void* _this, void* method) {
 		if (!g_saveAuditScanComplete) {
 			g_saveAuditScanComplete = true;
@@ -2910,6 +3260,7 @@ namespace
 		}
 		OverrideAllTransforms();
 		EventDates::TryDumpTable();  // [PATCH] v14 - master dump + one-shot "never ends" date patch
+		ViewDiag::Tick();            // [DIAG] v15 - periodic viewMapping dumps
 		return HOOK_CAST_CALL(void, MainThreadDispatcher_LateUpdate)(_this, method);
 	}
 
@@ -4695,6 +5046,7 @@ namespace
 		ADD_HOOK(GetCostumeListReply_get_AccessoryList, "GetCostumeListReply_get_AccessoryList at %p");
 		ADD_HOOK(LiveMVUnitConfirmationModel_ctor, "LiveMVUnitConfirmationModel_ctor at %p");
 		ADD_HOOK(RunwayUnitConfirmationModel_ctor, "RunwayUnitConfirmationModel_ctor at %p");
+		ViewDiag::InstallHooks(); // [DIAG] v15 - view connector / viewMapping diagnostics
 		ADD_HOOK(SwayString_SetupPoint, "SwayString_SetupPoint at %p");
 		ADD_HOOK(LiveMVUnit_GetMemberChangeRequestData, "LiveMVUnit_GetMemberChangeRequestData at %p");
 		ADD_HOOK(LiveMVUnitMemberChangePresenter_initializeAsync_b_4_MoveNext, "LiveMVUnitMemberChangePresenter_initializeAsync_b_4_MoveNext at %p");
