@@ -3062,6 +3062,7 @@ namespace
 	// optionally write the mapped index back into the LiveMVStartData field.
 	void* g_liveViewManager = nullptr;
 	Il2CppReflectionType* g_liveMusicSelectionType = nullptr;
+	Il2CppReflectionType* g_liveMvConfirmType = nullptr;
 
 	namespace SoloUnlock {
 		int ReadSongIdFromMvStage(void* mvStage);
@@ -3722,6 +3723,7 @@ namespace
 			try {
 				auto vn = reflection_type_name(viewType);
 				if (vn.find("ILiveMusicSelectionConnector") != std::string::npos) g_liveMusicSelectionType = viewType;
+				if (vn.find("ILiveMvUnitConfirmationConnector") != std::string::npos) g_liveMvConfirmType = viewType;
 				appendLog("view-jump-log.txt", timestamp() + " JumpView viewType=" + vn
 					+ " withFade=" + (withFade ? "1" : "0") + " stackOperation=" + std::to_string(stackOperation));
 			}
@@ -3735,6 +3737,7 @@ namespace
 			try {
 				auto vn = reflection_type_name(viewType);
 				if (vn.find("ILiveMusicSelectionConnector") != std::string::npos) g_liveMusicSelectionType = viewType;
+				if (vn.find("ILiveMvUnitConfirmationConnector") != std::string::npos) g_liveMvConfirmType = viewType;
 				appendLog("view-jump-log.txt", timestamp() + " JumpViewAsync viewType=" + vn
 					+ " withFade=" + (withFade ? "1" : "0") + " stackOperation=" + std::to_string(stackOperation));
 			}
@@ -5259,6 +5262,38 @@ namespace
 			catch (...) { LiveAck("open threw"); }
 		}
 
+		void LiveOpenConfirm() {
+			if (!g_liveViewManager) { LiveAck("confirm failed: viewManager=null"); return; }
+			Il2CppReflectionType* t = g_liveMvConfirmType;
+			if (!t) {
+				const char* as[] = { "PRISM.Legacy.dll", "PRISM.Adapters.dll", "PRISM.dll" };
+				for (const char* a : as) {
+					try { t = reflection::typeof(a, "PRISM.Adapters", "ILiveMvUnitConfirmationConnector"); }
+					catch (...) { t = nullptr; }
+					if (t) break;
+				}
+			}
+			if (!t) { LiveAck("confirm failed: type=null"); return; }
+			try {
+				auto fn = reinterpret_cast<void(*)(void*, Il2CppReflectionType*, bool, void*, int)>(
+					ViewDiag::ViewManager_JumpView_orig);
+				fn(g_liveViewManager, t, false, nullptr, 0);
+				LiveAck("confirm invoked");
+			}
+			catch (...) { LiveAck("confirm threw"); }
+		}
+
+		void LiveQuit() {
+			try {
+				auto quit = il2cpp_symbols::get_method_pointer(
+					"UnityEngine.CoreModule.dll", "UnityEngine", "Application", "Quit", 0);
+				if (!quit) { LiveAck("quit failed: method=null"); return; }
+				reinterpret_cast<void(*)()>(quit)();
+				LiveAck("quit invoked");
+			}
+			catch (...) { LiveAck("quit threw"); }
+		}
+
 		void LiveSkip() {
 			if (!g_liveOverlay) { LiveAck("skip failed: overlay=null"); return; }
 			if (!g_liveSkipMethod) { LiveAck("skip failed: method=null"); return; }
@@ -5443,8 +5478,10 @@ namespace
 			else if (verb == "chorus") LiveApply(1, 0);
 			else if (verb == "start") LiveStart();
 			else if (verb == "open") LiveOpenMusic();
+			else if (verb == "confirm") LiveOpenConfirm();
 			else if (verb == "home") LiveOpenHome();
 			else if (verb == "skip") LiveSkip();
+			else if (verb == "quit") LiveQuit();
 			else if (verb == "dump") { LiveDump(); LiveAck("dump"); }
 			else LiveAck("unknown command: " + verb);
 		}
