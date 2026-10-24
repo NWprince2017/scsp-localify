@@ -2,6 +2,9 @@
 #include <unordered_set>
 #include <ranges>
 #include <set>
+#include <mutex>
+#include <cstdint>
+#include <cstdio>
 #include <Psapi.h>
 #include <intsafe.h>
 #include "scgui/scGUIData.hpp"
@@ -25,7 +28,7 @@ bool needPrintStack = false;
 std::vector<std::pair<std::pair<int, int>, int>> replaceDressResIds{};
 std::map<std::string, CharaParam_t> charaParam{};
 CharaParam_t baseParam(0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
-std::vector<std::function<bool()>> mainThreadTasks{};  // 返回 true，执行后移除列表；返回 false，执行后不移除
+std::vector<std::function<bool()>> mainThreadTasks{};  // 返回 true，执行后移除列表；返�?false，执行后不移�?
 
 std::map<int, CharaSwayStringParam_t> charaSwayStringOffset{};
 std::map<int, std::string> swayTypes{
@@ -551,9 +554,9 @@ namespace
 		{
 			replaceFont = il2cpp_gchandle_get_target(ReplaceFontGcHandle);
 
-			// 加载场景时会被 Resources.UnloadUnusedAssets 干掉，且不受 DontDestroyOnLoad 影响，暂且判断是否存活，并在必要的时候重新加载
-			// TODO: 考虑挂载到 GameObject 上
-			// AssetBundle 不会被干掉
+			// 加载场景时会�?Resources.UnloadUnusedAssets 干掉，且不受 DontDestroyOnLoad 影响，暂且判断是否存活，并在必要的时候重新加�?
+			// TODO: 考虑挂载�?GameObject �?
+			// AssetBundle 不会被干�?
 			if (Object_IsNativeObjectAlive(replaceFont))
 			{
 				return replaceFont;
@@ -588,7 +591,7 @@ namespace
 
 	std::filesystem::path dumpBasePath("dumps");
 
-	// 调用之前检查 DataFile_IsKeyExist
+	// 调用之前检�?DataFile_IsKeyExist
 	void fmtAndDumpJsonBytesData(const std::wstring& dumpName) {
 		const auto dumpNameIl = il2cpp_symbols::NewWStr(dumpName);
 		auto dataBytes = (reinterpret_cast<void* (*)(Il2CppString*)>HOOK_GET_ORIG(DataFile_GetBytes))(dumpNameIl);
@@ -601,7 +604,7 @@ namespace
 			writeWstr.replace(pos, 1, replaceStr);
 			pos = writeWstr.find(searchStr, pos + replaceStr.length());
 		}
-		if (writeWstr.ends_with(L",]")) {  // 代哥的 Json 就是不一样
+		if (writeWstr.ends_with(L",]")) {  // 代哥�?Json 就是不一�?
 			writeWstr.erase(writeWstr.length() - 2, 1);
 		}
 		const auto dumpLocalFilePath = dumpBasePath / SCLocal::getFilePathByName(dumpName, true, dumpBasePath);
@@ -675,7 +678,7 @@ namespace
 		catch (std::exception& e) {
 			printf("dumpScenarioFromCatalog error: %s\n", e.what());
 		}
-		// 下方方法已过时
+		// 下方方法已过�?
 		int totalCount = 0;
 		const auto titleData = nlohmann::json::parse(localizationDataCache);
 		for (auto& it : titleData.items()) {
@@ -768,6 +771,728 @@ namespace
 	}
 
 	// photo studio unlocking
+	// =====================================================================
+	// [PATCH] v10 - permanent limited-time EVENTS (Shiny Runway and friends)
+	//
+	//   The client decides "this event is over" from its own master table
+	//   PRISM.Definitions.MstEvent { Id, EventType, BeginDate, EndDate, ... }.
+	//   That table is inside the encrypted master, so no offline-server reply
+	//   can change it - the two DateTime fields have to be rewritten in
+	//   memory, exactly like the costume isUnlocked_ flag was.
+	//
+	//   v10 hooked set_BeginDate / set_EndDate and WROTE the new dates back into
+	//   the master rows.  That crashed the game before the title screen with
+	//   ErrorCode[E6A359E6] and produced a 17 MB mst-events.txt full of garbage,
+	//   i.e. either the resolved method or its calling convention was wrong, so
+	//   the writes landed on unrelated objects.
+	//
+	//   v11 is therefore strictly READ-ONLY: it hooks the *getter* get_EndDate
+	//   and replaces its RETURN VALUE.  Nothing is ever written to memory, and
+	//   the override only happens when the returned value is unmistakably a
+	//   DateTime in ticks (2000..2100).  If this build ever returns something
+	//   else (e.g. a pointer to the struct), the original value is handed back
+	//   untouched - a wrong guess can therefore only fail to have an effect, it
+	//   cannot corrupt anything.
+	//
+	//   System.DateTime is one ulong of 100 ns ticks since 0001-01-01:
+	//       ticks = (unixSeconds + 62135596800) * 10000000
+	//   2000-01-01 -> 630822816000000000
+	//   2038-01-19 -> 642830804470000000   (the value handed back = "never ends")
+	//
+	//   mst-events.txt always records the real values, so the data is verifiable
+	//   even with the patch switched off (scsp-config.json "extendEventDates").
+	//
+	//   v13 (diagnostic, NO hooks): v12 crashed the game twice right after it
+	//   installed its hooks (0xc0000005 inside GameAssembly, same offset both
+	//   runs).  runway-diag.txt showed why the getters cannot be hooked:
+	//   get_EndDate / get_BeginDate report MH_ERROR_ALREADY_CREATED (their code
+	//   addresses are already hooked or shared via ICF with unrelated methods -
+	//   which is also why v11 never produced mst-events.txt), and the two new
+	//   hooks that did install sit on addresses shared by other getters.
+	//   v13 therefore installs NOTHING and calls NOTHING: it reads the real
+	//   stored values straight out of MasterData.Events by field offset
+	//   (mst-events-table.txt) and writes an install report (runway-diag.txt).
+	//
+	//   v14 (the real fix, still NO hooks): once per session the newest
+	//   Shiny Runway row (EventType==7, highest Id) is overwritten in the
+	//   live master - EndDate and DisplayEndDate := 2099-12-31 23:59:59,
+	//   BeginDate stays 2026-09-26 20:30 (already in the past), so the
+	//   event window permanently contains "now" and the event can never be
+	//   over.  The write targets the exact FieldInfo offset of the row that
+	//   was just verified to be a real MstEvent - no hook, no managed call,
+	//   no other object is touched.  The result is logged to
+	//   mst-events-patch.txt (old value -> new value, read back).
+	//
+	//   v15: identical writes, but applied to EVERY Shiny Runway row
+	//   (EventType==7) of this master - all five holdings become permanent
+	//   events in the list, each still with its own real BeginDate.  Rows
+	//   that fail the DateTime sanity check are skipped individually, so
+	//   one odd row can never keep the others from being patched.
+	// =====================================================================
+
+	namespace EventDates {
+		// v13: strictly read-only master dump.  No hooks, no managed calls -
+		// every value is read straight out of the master objects by field
+		// offset, so nothing here can execute game code or write memory.
+		std::mutex& Mtx() { static std::mutex m; return m; }
+
+		void DumpLine(const std::string& line) {
+			std::lock_guard<std::mutex> lk(Mtx());
+			std::ofstream f("mst-events-table.txt", std::ios::app);
+			if (!f.is_open()) return;
+			f << line << "\n";
+			f.flush();
+		}
+
+		bool PlausiblePtr(uint64_t p) {
+			return p >= 0x10000ULL && p < 0x7FFFFFFFFFFFULL && (p & 7) == 0;
+		}
+
+		// klass pointer of a live object = first 8 bytes (pure read)
+		void* ClassOf(void* obj) {
+			if (!obj || !PlausiblePtr((uint64_t)obj)) return nullptr;
+			return il2cpp_symbols::get_class_from_instance(obj);
+		}
+
+		const char* ClassNameOf(void* obj) {
+			auto k = ClassOf(obj);
+			return k ? il2cpp_class_get_name(k) : nullptr;
+		}
+
+		FieldInfo* Field(void* klass, const char* name) {
+			return klass ? il2cpp_symbols_logged::il2cpp_class_get_field_from_name(klass, name) : nullptr;
+		}
+
+		void* ReadPtr(void* obj, const char* fieldName) {
+			auto fi = Field(ClassOf(obj), fieldName);
+			if (!fi) return nullptr;
+			return il2cpp_symbols::read_field<void*>(obj, fi);
+		}
+
+		int ReadInt(void* obj, const char* fieldName) {
+			auto fi = Field(ClassOf(obj), fieldName);
+			if (!fi) return -1;
+			return il2cpp_symbols::read_field<int>(obj, fi);
+		}
+
+		std::string Hex(uint64_t v) {
+			char b[32];
+			snprintf(b, sizeof(b), "%llx", (unsigned long long)v);
+			return b;
+		}
+
+		std::string PtrStr(void* p) { return "0x" + Hex((uint64_t)p); }
+
+		// IL2CPP array on x64: [klass(8) monitor(8) bounds(8) max_length(4)+pad]
+		// -> elements start at +0x20
+		int ArrayLength(void* arr) {
+			if (!arr || !PlausiblePtr((uint64_t)arr)) return 0;
+			int n = *reinterpret_cast<int*>(reinterpret_cast<uintptr_t>(arr) + 0x18);
+			return (n >= 0 && n <= 1000000) ? n : 0;
+		}
+		uintptr_t ArrayElem(void* arr, int i, int stride) {
+			return reinterpret_cast<uintptr_t>(arr) + 0x20 + (size_t)i * stride;
+		}
+
+		// MstEvent backing fields (names verified against global-metadata.dat)
+		struct MstFields {
+			FieldInfo* id = nullptr;
+			FieldInfo* type = nullptr;
+			FieldInfo* begin = nullptr;
+			FieldInfo* end = nullptr;
+			FieldInfo* dispEnd = nullptr;
+		};
+		MstFields& Fields() {
+			static MstFields f = [] {
+				MstFields r;
+				auto k = il2cpp_symbols_logged::get_class("PRISM.Definitions.dll", "PRISM.Definitions", "MstEvent");
+				if (k) {
+					r.id = Field(k, "<Id>k__BackingField");
+					r.type = Field(k, "<EventType>k__BackingField");
+					r.begin = Field(k, "<BeginDate>k__BackingField");
+					r.end = Field(k, "<EndDate>k__BackingField");
+					r.dispEnd = Field(k, "<DisplayEndDate>k__BackingField");
+				}
+				return r;
+			}();
+			return f;
+		}
+
+		// ---------------- v14 "never ends" patch (field write only) ----------------
+		// 2099-12-31 23:59:59 UTC as a System.DateTime: ticks since 0001-01-01
+		// = 662380415990000000, Kind=Utc sets bit 62.
+		constexpr uint64_t kNeverEnds = 5274066434417387904ULL;
+
+		// v15: every EventType==7 row seen by the master walk (dedup by Id -
+		// the walk can be attempted more than once per session)
+		std::vector<std::pair<int, void*>> g_runwayRows;
+
+		void PatchLine(const std::string& line) {
+			std::lock_guard<std::mutex> lk(Mtx());
+			std::ofstream f("mst-events-patch.txt", std::ios::app);
+			if (!f.is_open()) return;
+			f << line << "\n";
+			f.flush();
+		}
+
+		bool LooksLikeDateTime(uint64_t raw) {
+			uint64_t ticks = raw & 0x3FFFFFFFFFFFFFFFULL;
+			return ticks >= 630822816000000000ULL   // 2000-01-01
+				&& ticks <= 662380415990000000ULL;  // 2099-12-31
+		}
+
+		// called once, right after the master walk has seen every row
+		void ApplyPatch() {
+			static bool done = false;
+			if (done) return;
+			done = true;
+			if (!g_extend_event_dates) {
+				PatchLine("extendEventDates=false - master untouched (diagnostic run)");
+				return;
+			}
+			if (g_runwayRows.empty()) {
+				PatchLine("no EventType==7 row found - master untouched");
+				return;
+			}
+			auto& F = Fields();
+			if (!F.end || !F.dispEnd) {
+				PatchLine("MstEvent date fields unresolved - master untouched");
+				return;
+			}
+			PatchLine("patching " + std::to_string(g_runwayRows.size()) + " Shiny Runway row(s)");
+			for (auto& r : g_runwayRows) {
+				int id = r.first;
+				void* row = r.second;
+				uint64_t oldEnd = il2cpp_symbols::read_field<uint64_t>(row, F.end);
+				uint64_t oldDisp = il2cpp_symbols::read_field<uint64_t>(row, F.dispEnd);
+				// sanity: the old values must look like real DateTimes (2000..2099),
+				// otherwise this row is not what we think it is - do not touch it
+				if (!LooksLikeDateTime(oldEnd) || !LooksLikeDateTime(oldDisp)) {
+					PatchLine("row id=" + std::to_string(id)
+						+ " has unexpected date values - skipped");
+					continue;
+				}
+				il2cpp_symbols::write_field<uint64_t>(row, F.end, kNeverEnds);
+				il2cpp_symbols::write_field<uint64_t>(row, F.dispEnd, kNeverEnds);
+				uint64_t newEnd = il2cpp_symbols::read_field<uint64_t>(row, F.end);
+				uint64_t newDisp = il2cpp_symbols::read_field<uint64_t>(row, F.dispEnd);
+				PatchLine("PATCHED id=" + std::to_string(id)
+					+ " row=" + PtrStr(row)
+					+ " end " + std::to_string(oldEnd) + " -> " + std::to_string(newEnd)
+					+ " | displayEnd " + std::to_string(oldDisp) + " -> " + std::to_string(newDisp));
+			}
+		}
+
+		// (v13: no call logging, no caller resolution, no managed method calls -
+		// all values are read straight from the row's fields.)
+
+		// ---------------- v13 master table dump (pure field reads) ----------------
+		// MasterData.Events (name verified against global-metadata.dat) holds the
+		// MstEvent table.  Dump the client's own rows once per session so the real
+		// stored dates can be compared with what the getters report.  Every value
+		// below is read straight from the object graph - no method is called.
+		std::string CN(void* o) {
+			const char* n = ClassNameOf(o);
+			return n ? n : "?";
+		}
+
+		void DumpRow(void* item, int* count) {
+			if (!item || *count >= 4000) return;
+			if (!PlausiblePtr((uint64_t)item)) return;
+			auto k = il2cpp_symbols::get_class_from_instance(item);
+			const char* cn = k ? il2cpp_class_get_name(k) : nullptr;
+			if (!cn || strcmp(cn, "MstEvent") != 0) return;
+			auto& F = Fields();
+			if (!F.id || !F.type || !F.begin || !F.end || !F.dispEnd) return;
+			++*count;
+			int idv = il2cpp_symbols::read_field<int>(item, F.id);
+			int tv = il2cpp_symbols::read_field<int>(item, F.type);
+			if (tv == 7) {
+				// v15 target list: dedup by Id, keep the first pointer seen
+				bool seen = false;
+				for (auto& r : g_runwayRows) { if (r.first == idv) { seen = true; break; } }
+				if (!seen && g_runwayRows.size() < 64) g_runwayRows.push_back(std::make_pair(idv, item));
+			}
+			char buf[320];
+			snprintf(buf, sizeof(buf),
+				"MstEvent id=%d type=%d begin=%llu end=%llu displayEnd=%llu",
+				idv, tv,
+				(unsigned long long)il2cpp_symbols::read_field<uint64_t>(item, F.begin),
+				(unsigned long long)il2cpp_symbols::read_field<uint64_t>(item, F.end),
+				(unsigned long long)il2cpp_symbols::read_field<uint64_t>(item, F.dispEnd));
+			DumpLine(buf);
+		}
+
+		bool Contains(const char* hay, const char* needle) {
+			return hay && strstr(hay, needle) != nullptr;
+		}
+
+		// walkers: the container class is decided from its own name, then the
+		// backing fields are read directly (List`1 / Dictionary`2 / SortedList`2 /
+		// array).  Element stride assumes the standard IL2CPP x64 layout.
+		void DumpListLike(void* list, int* n, const char* itemsName, const char* sizeName) {
+			auto arr = ReadPtr(list, itemsName);
+			int size = ReadInt(list, sizeName);
+			if (size < 0) size = ArrayLength(arr);
+			if (size > 4000) size = 4000;
+			DumpLine("  (list " + CN(list) + " size=" + std::to_string(size) + ")");
+			if (!arr || !PlausiblePtr((uint64_t)arr)) { DumpLine("  (items array missing)"); return; }
+			for (int i = 0; i < size; i++) DumpRow(*(void**)ArrayElem(arr, i, 8), n);
+		}
+
+		void DumpDictionary(void* dict, int* n) {
+			auto entries = ReadPtr(dict, "_entries");
+			int count = ReadInt(dict, "_count");
+			if (count < 0) count = ArrayLength(entries);
+			if (count > 1000000) count = 1000000;
+			DumpLine("  (dict " + CN(dict) + " count=" + std::to_string(count) + ")");
+			if (!entries || !PlausiblePtr((uint64_t)entries)) { DumpLine("  (entries array missing)"); return; }
+			for (int i = 0; i < count; i++) {
+				uintptr_t e = ArrayElem(entries, i, 24);   // Entry<int, MstEvent>
+				if (*(int*)e < 0) continue;               // free slot
+				DumpRow(*(void**)(e + 16), n);
+			}
+		}
+
+		void DumpSortedList(void* sl, int* n) {
+			auto values = ReadPtr(sl, "values");
+			int size = ReadInt(sl, "_size");
+			if (size < 0) size = ArrayLength(values);
+			if (size > 4000) size = 4000;
+			DumpLine("  (sortedlist " + CN(sl) + " size=" + std::to_string(size) + ")");
+			if (!values || !PlausiblePtr((uint64_t)values)) { DumpLine("  (values array missing)"); return; }
+			for (int i = 0; i < size; i++) DumpRow(*(void**)ArrayElem(values, i, 8), n);
+		}
+
+		void DumpArray(void* arr, int* n) {
+			int len = ArrayLength(arr);
+			DumpLine("  (array len=" + std::to_string(len) + ")");
+			for (int i = 0; i < len && i < 4000; i++) DumpRow(*(void**)ArrayElem(arr, i, 8), n);
+		}
+
+		// fallback: storage class unknown - probe the usual backing field names
+		// and report what exists so the next build can target it exactly
+		void ProbeUnknown(void* container, int* n) {
+			(void)n;
+			auto k = ClassOf(container);
+			DumpLine("  (unknown container " + CN(container) + " - probing fields)");
+			static const char* kProbe[] = { "_items", "items", "_values", "values", "_list", "list", "_entries", "entries", "_array", "array", "_data", "data" };
+			for (const char* fn : kProbe) {
+				auto fi = Field(k, fn);
+				if (!fi) continue;
+				DumpLine(std::string("    field ") + fn + " offset=" + std::to_string(fi->offset));
+			}
+		}
+
+		void TryDumpTable() {
+			static long frame = 0;
+			static int tries = 0;
+			static bool finished = false;
+			if (finished) return;
+			if ((++frame % 60) != 1) return;
+			if (++tries > 180) { finished = true; DumpLine("(gave up after 180 attempts)"); return; }
+
+			// the only managed calls kept: two getters proven safe in v11/v12
+			static auto method_get_Instance = il2cpp_symbols_logged::get_method(
+				"PRISM.Adapters.dll", "PRISM.Adapters", "IAdapterLocator", "get_Instance", 0);
+			if (!method_get_Instance || !method_get_Instance->methodPointer) return;
+			auto locator = method_get_Instance->Invoke<Il2CppObject*>(nullptr, {});
+			if (!locator) return;
+			auto locatorType = il2cpp_symbols::get_class_from_instance(locator);
+			auto mget = locatorType ? il2cpp_class_get_method_from_name(locatorType, "get_MasterData", 0) : nullptr;
+			if (!mget || !mget->methodPointer) return;
+			auto masterData = mget->Invoke<Il2CppObject*>(locator, {});
+			if (!masterData) return;
+
+			static auto klass_MasterData = il2cpp_symbols_logged::get_class(
+				"PRISM.Definitions.dll", "PRISM.Definitions", "MasterData");
+			if (!klass_MasterData) return;
+			auto fi = il2cpp_symbols_logged::il2cpp_class_get_field_from_name(klass_MasterData, "Events");
+			if (!fi) { DumpLine("MasterData.Events field not found"); return; }
+			auto table = il2cpp_symbols::read_field<Il2CppObject*>(masterData, fi);
+			if (!table) { DumpLine("MasterData.Events = null"); return; }
+			DumpLine("MasterData.Events -> " + CN(table) + " @ " + PtrStr(table));
+
+			// SortedMasterTable`2 itself has no fields - "data" lives on the base
+			// MasterTable`1, which il2cpp_class_get_field_from_name also searches
+			auto data = ReadPtr(table, "data");
+			DumpLine("  data=" + PtrStr(data));
+			if (!data || !PlausiblePtr((uint64_t)data)) return;
+			const char* dcn = ClassNameOf(data);
+			DumpLine(std::string("  data class=") + (dcn ? dcn : "?"));
+			int n = 0;
+			if (Contains(dcn, "List`1")) DumpListLike(data, &n, "_items", "_size");
+			else if (Contains(dcn, "Dictionary`2")) DumpDictionary(data, &n);
+			else if (Contains(dcn, "SortedList`2")) DumpSortedList(data, &n);
+			else if (Contains(dcn, "[]")) DumpArray(data, &n);
+			else ProbeUnknown(data, &n);
+			DumpLine("  entries=" + std::to_string(n));
+			if (n > 0) {
+				finished = true;
+				ApplyPatch();   // v15: overwrite every Shiny Runway row's dates
+			}
+		}
+	}
+
+	// =====================================================================
+	// [DIAG] v21 - runway master/runtime field dump (read-only reflection).
+	//   The il2cpp_symbols import table has no field-enumeration entries, so
+	//   il2cpp_class_get_fields / il2cpp_field_get_flags are resolved straight
+	//   from GameAssembly.dll; FieldInfo itself carries name/type/offset.
+	//   Output (append):
+	//     runway-master-dump.txt  - MstRunway*/MstEvent class field lists,
+	//       the MasterData field list, every Runway* master table row and
+	//       every Shiny Runway MstEvent row with ALL of its fields.
+	//     runway-runtime-dump.txt - every RunwayEventStartData handed to
+	//       PreLoadAsync (once per object).
+	//   Read-only: no writes, no managed calls beyond the two getters
+	//   EventDates already uses.
+	// =====================================================================
+	namespace RunwayDump {
+		using EventDates::PlausiblePtr;
+		using EventDates::ClassOf;
+		using EventDates::ClassNameOf;
+		using EventDates::ArrayLength;
+		using EventDates::ArrayElem;
+		using EventDates::PtrStr;
+		using EventDates::Hex;
+		using EventDates::ReadPtr;
+		using EventDates::ReadInt;
+
+		int g_lines = 0;
+		std::unordered_set<uintptr_t> g_seen;
+		int g_startDataClasses = 0;
+
+		void DumpLine(const char* file, const std::string& line) {
+			if (g_lines++ > 45000) return;
+			std::lock_guard<std::mutex> lk(EventDates::Mtx());
+			std::ofstream f(file, std::ios::app);
+			if (!f.is_open()) return;
+			f << line << "\n";
+			f.flush();
+		}
+		void ToMaster(const std::string& l) { DumpLine("runway-master-dump.txt", l); }
+		void ToRuntime(const std::string& l) { DumpLine("runway-runtime-dump.txt", l); }
+
+		struct FieldApi {
+			void* (*class_get_fields)(void*, void**) = nullptr;
+			uint32_t(*field_get_flags)(void*) = nullptr;
+			bool ok = false;
+		};
+		FieldApi& API() {
+			static FieldApi a = [] {
+				FieldApi r;
+				auto m = GetModuleHandleW(L"GameAssembly.dll");
+				if (m) {
+					r.class_get_fields = reinterpret_cast<decltype(r.class_get_fields)>(GetProcAddress(m, "il2cpp_class_get_fields"));
+					r.field_get_flags = reinterpret_cast<decltype(r.field_get_flags)>(GetProcAddress(m, "il2cpp_field_get_flags"));
+				}
+				r.ok = r.class_get_fields && r.field_get_flags;
+				return r;
+			}();
+			return a;
+		}
+
+		bool NameHas(const char* n, std::initializer_list<const char*> keys) {
+			if (!n) return false;
+			for (auto k : keys) if (strstr(n, k)) return true;
+			return false;
+		}
+
+		// best-effort "Id" of an Mst* row (backing field then property name)
+		std::string BestId(void* obj, const char* cn) {
+			if (!obj || !cn || strncmp(cn, "Mst", 3) != 0) return "";
+			auto k = ClassOf(obj);
+			for (const char* fname : { "<Id>k__BackingField", "<Id>", "Id" }) {
+				auto fi = il2cpp_symbols_logged::il2cpp_class_get_field_from_name(k, fname);
+				if (fi) return std::format(" {}#{}", cn, il2cpp_symbols::read_field<int>(obj, fi));
+			}
+			return "";
+		}
+
+		std::string ReadValue(void* obj, const FieldInfo* fi, const std::string& ts) {
+			const size_t off = (size_t)fi->offset;
+			if (off < 0x10 || off > 0x8000) return "(bad-off)";
+			auto p = reinterpret_cast<uintptr_t>(obj) + off;
+			uint64_t raw = *reinterpret_cast<uint64_t*>(p);
+			if (ts == "System.String") {
+				try {
+					void* s = il2cpp_field_get_value_object((void*)fi, obj);
+					if (!s) return "null";
+					return "\"" + reinterpret_cast<Il2CppString*>(s)->ToUtf8String() + "\"";
+				}
+				catch (...) { return "(string-err)"; }
+			}
+			if (ts == "System.Int64" || ts == "System.UInt64" || ts == "System.DateTime")
+				return std::format("{} 0x{}", (long long)raw, Hex(raw));
+			if (ts == "System.Int32" || ts == "System.UInt32")
+				return std::to_string((int)(uint32_t)raw);
+			if (ts == "System.Boolean")
+				return (raw & 0xFF) ? "true" : "false";
+			if (ts == "System.Single") {
+				uint32_t u = (uint32_t)raw; float f = 0;
+				std::memcpy(&f, &u, 4);
+				return std::to_string(f);
+			}
+			if (ts == "System.Double") {
+				double d = 0; std::memcpy(&d, &raw, 8);
+				return std::to_string(d);
+			}
+			if (PlausiblePtr(raw)) {
+				std::string r = PtrStr(reinterpret_cast<void*>(raw));
+				auto k2 = ClassOf(reinterpret_cast<void*>(raw));
+				const char* cn2 = k2 ? il2cpp_class_get_name(k2) : nullptr;
+				if (cn2) r += std::string(" ") + cn2 + BestId(reinterpret_cast<void*>(raw), cn2);
+				return r;
+			}
+			return "0x" + Hex(raw);
+		}
+
+		void ReflectDump(void* obj, int depth, const char* tag, bool runtime);
+
+		void DumpContainerElems(void* cont, int stride, int capacity, const char* tag, int depth, bool runtime) {
+			int len = ArrayLength(cont);
+			if (len > capacity) len = capacity;
+			for (int i = 0; i < len; i++) {
+				auto e = ArrayElem(cont, i, stride);
+				if (!e) continue;
+				void* item = *reinterpret_cast<void**>(e);
+				if (!item) continue;
+				ReflectDump(item, depth, tag, runtime);
+			}
+		}
+
+		void ReflectDump(void* obj, int depth, const char* tag, bool runtime) {
+			if (!obj || !PlausiblePtr((uint64_t)obj)) return;
+			void (*W)(const std::string&) = runtime ? ToRuntime : ToMaster;
+			if (!g_seen.insert((uintptr_t)obj).second) return;
+			auto k = ClassOf(obj);
+			const char* cn = k ? il2cpp_class_get_name(k) : nullptr;
+			std::string c = cn ? cn : "?";
+			W(std::format("  [{}] {} @ {}", tag, c, PtrStr(obj)));
+
+			if (c.find("List`1") != std::string::npos) {
+				auto arr = ReadPtr(obj, "_items");
+				int size = ReadInt(obj, "_size");
+				W(std::format("    list size={} items={}", size, PtrStr(arr)));
+				if (arr && PlausiblePtr((uint64_t)arr)) DumpContainerElems(arr, 8, 64, tag, depth, runtime);
+				return;
+			}
+			if (!c.empty() && c.back() == ']') {
+				if (NameHas(c.c_str(), { "Runway", "Scene", "Stage", "Mst" })) DumpContainerElems(obj, 8, 64, tag, depth, runtime);
+				return;
+			}
+			if (!API().ok) { W("    (field API unavailable)"); return; }
+
+			void* iter = nullptr;
+			void* fiRaw = nullptr;
+			int found = 0;
+			while ((fiRaw = API().class_get_fields(k, &iter)) != nullptr) {
+				if (++found > 250) { W("    ... (field cap)"); break; }
+				auto fi = reinterpret_cast<const FieldInfo*>(fiRaw);
+				uint32_t flags = API().field_get_flags(fiRaw);
+				if (flags & (0x10 | 0x40)) continue;   // static / literal
+				std::string ts = fi->type ? il2cpp_type_get_name(fi->type) : "";
+				std::string vs = ReadValue(obj, fi, ts);
+				W(std::format("    {} = {} ({} @{})", fi->name ? fi->name : "?", vs, ts, fi->offset));
+				if (depth <= 0 || ts.empty()) continue;
+				if (ts.rfind("System.", 0) == 0
+					&& !NameHas(ts.c_str(), { "Runway", "Camerawork", "LiveCut", "Scene", "Stage" })) continue;
+				if ((size_t)fi->offset < 0x10 || (size_t)fi->offset > 0x8000) continue;
+				uint64_t raw = *reinterpret_cast<uint64_t*>(reinterpret_cast<uintptr_t>(obj) + (size_t)fi->offset);
+				if (!PlausiblePtr(raw)) continue;
+				auto child = reinterpret_cast<void*>(raw);
+				auto ck = ClassOf(child);
+				const char* ccn = ck ? il2cpp_class_get_name(ck) : nullptr;
+				if (!ccn) continue;
+				bool isArr = ts.size() >= 2 && ts[ts.size() - 1] == ']';
+				if (!isArr && !NameHas(ccn, { "Runway", "Scene", "Stage", "MstEvent", "Camerawork", "LiveCut" })
+					&& !NameHas(ts.c_str(), { "Runway", "Scene", "Stage", "Camerawork", "LiveCut" })) continue;
+				if (isArr && !NameHas(ts.c_str(), { "Runway", "Scene", "Stage", "Mst", "Camerawork", "LiveCut" })) continue;
+				ReflectDump(child, depth - 1, fi->name ? fi->name : "?", runtime);
+			}
+		}
+
+		void DumpClassFields(void* klass, const char* label, void (*W)(const std::string&)) {
+			if (!klass) { W(std::format("=== class {} : NOT FOUND ===", label)); return; }
+			W(std::format("=== fields of {} ===", label));
+			if (!API().ok) { W("  (field API unavailable)"); return; }
+			void* iter = nullptr;
+			void* fiRaw = nullptr;
+			int cap = 0;
+			while ((fiRaw = API().class_get_fields(klass, &iter)) != nullptr) {
+				if (++cap > 300) break;
+				auto fi = reinterpret_cast<const FieldInfo*>(fiRaw);
+				uint32_t flags = API().field_get_flags(fiRaw);
+				if (flags & 0x40) continue;
+				std::string ts = fi->type ? il2cpp_type_get_name(fi->type) : "?";
+				W(std::format("  {}{} off={} type={}", (flags & 0x10) ? "static " : "", fi->name ? fi->name : "?", fi->offset, ts));
+			}
+		}
+
+		void DumpTableRows(void* table, const char* label, int maxRows = 1000) {
+			ToMaster(std::format("--- table {} ---", label));
+			if (!table || !PlausiblePtr((uint64_t)table)) { ToMaster("  (null)"); return; }
+			const char* tcn = ClassNameOf(table);
+			ToMaster(std::format("  container {} {}", tcn ? tcn : "?", PtrStr(table)));
+			auto data = ReadPtr(table, "data");   // MasterTable`1.data
+			const char* dcn = data && PlausiblePtr((uint64_t)data) ? ClassNameOf(data) : nullptr;
+			ToMaster(std::format("  data={} {}", data ? PtrStr(data) : "(null)", dcn ? dcn : ""));
+			if (!dcn) return;
+			std::string c = dcn;
+			if (c.find("List`1") != std::string::npos) {
+				auto arr = ReadPtr(data, "_items");
+				int size = ReadInt(data, "_size");
+				if (size < 0) size = ArrayLength(arr);
+				if (size > maxRows) size = maxRows;
+				ToMaster(std::format("  list size={}", size));
+				if (arr && PlausiblePtr((uint64_t)arr))
+					for (int i = 0; i < size; i++) ReflectDump(*(void**)ArrayElem(arr, i, 8), 1, label, false);
+			}
+			else if (c.find("Dictionary`2") != std::string::npos) {
+				auto entries = ReadPtr(data, "_entries");
+				int count = ReadInt(data, "_count");
+				if (count < 0) count = ArrayLength(entries);
+				if (count > maxRows) count = maxRows;
+				ToMaster(std::format("  dict count={}", count));
+				if (entries && PlausiblePtr((uint64_t)entries))
+					for (int i = 0; i < count; i++) {
+						uintptr_t e = ArrayElem(entries, i, 24);
+						if (*(int*)e < 0) continue;
+						ReflectDump(*(void**)(e + 16), 1, label, false);
+					}
+			}
+			else if (c.find("SortedList`2") != std::string::npos) {
+				auto values = ReadPtr(data, "values");
+				int size = ReadInt(data, "_size");
+				if (size < 0) size = ArrayLength(values);
+				if (size > 1000) size = 1000;
+				ToMaster(std::format("  sortedlist size={}", size));
+				if (values && PlausiblePtr((uint64_t)values))
+					for (int i = 0; i < size; i++) ReflectDump(*(void**)ArrayElem(values, i, 8), 1, label, false);
+			}
+			else if (!c.empty() && c.back() == ']') {
+				DumpContainerElems(data, 8, maxRows, label, 1, false);
+			}
+			else {
+				ToMaster(std::format("  (container class {} not walkable)", c));
+			}
+		}
+
+		// one-shot: dump the runway master tables + all Shiny Runway MstEvent rows
+		void TryDumpMasters() {
+			static bool done = false;
+			static long frame = 0;
+			static int tries = 0;
+			if (done) return;
+			if ((++frame % 90) != 1) return;
+			if (++tries > 300) { done = true; return; }
+			if (!API().ok) {
+				if (tries == 1) ToMaster("field-enumeration API unresolved - dump skipped");
+				done = true;
+				return;
+			}
+			if (EventDates::g_runwayRows.empty()) return;
+
+			static auto method_get_Instance = il2cpp_symbols_logged::get_method(
+				"PRISM.Adapters.dll", "PRISM.Adapters", "IAdapterLocator", "get_Instance", 0);
+			if (!method_get_Instance || !method_get_Instance->methodPointer) return;
+			auto locator = method_get_Instance->Invoke<Il2CppObject*>(nullptr, {});
+			if (!locator) return;
+			auto locatorType = il2cpp_symbols::get_class_from_instance(locator);
+			auto mget = locatorType ? il2cpp_class_get_method_from_name(locatorType, "get_MasterData", 0) : nullptr;
+			if (!mget || !mget->methodPointer) return;
+			auto masterData = mget->Invoke<Il2CppObject*>(locator, {});
+			if (!masterData) return;
+			done = true;
+
+			ToMaster(std::format("=== v21 runway master dump (pid {}) ===", GetCurrentProcessId()));
+			DumpClassFields(il2cpp_symbols_logged::get_class("PRISM.Definitions.dll", "PRISM.Definitions", "MstRunwayScene"), "MstRunwayScene", ToMaster);
+			DumpClassFields(il2cpp_symbols_logged::get_class("PRISM.Definitions.dll", "PRISM.Definitions", "MstRunwayStage"), "MstRunwayStage", ToMaster);
+			DumpClassFields(il2cpp_symbols_logged::get_class("PRISM.Definitions.dll", "PRISM.Definitions", "MstRunwayMotion"), "MstRunwayMotion", ToMaster);
+			DumpClassFields(il2cpp_symbols_logged::get_class("PRISM.Definitions.dll", "PRISM.Definitions", "MstEvent"), "MstEvent", ToMaster);
+			DumpClassFields(il2cpp_symbols_logged::get_class("PRISM.Definitions.dll", "PRISM.Definitions", "MstLiveCutScene"), "MstLiveCutScene", ToMaster);
+			DumpClassFields(il2cpp_symbols_logged::get_class("PRISM.Definitions.dll", "PRISM.Definitions", "MstLiveCutSceneCostume"), "MstLiveCutSceneCostume", ToMaster);
+
+			auto mk = il2cpp_symbols::get_class_from_instance(masterData);
+			ToMaster("=== MasterData fields ===");
+			std::vector<std::pair<std::string, void*>> tables;
+			void* iter = nullptr;
+			void* fiRaw = nullptr;
+			int cap = 0;
+			while ((fiRaw = API().class_get_fields(mk, &iter)) != nullptr && cap++ < 500) {
+				auto fi = reinterpret_cast<const FieldInfo*>(fiRaw);
+				const char* fn = fi->name;
+				std::string ts = fi->type ? il2cpp_type_get_name(fi->type) : "?";
+				void* v = il2cpp_symbols::read_field<void*>(masterData, fi);
+				const char* vc = v && PlausiblePtr((uint64_t)v) ? ClassNameOf(v) : nullptr;
+				ToMaster(std::format("  {} : {} = {} {}", fn ? fn : "?", ts,
+					v && PlausiblePtr((uint64_t)v) ? PtrStr(v) : "(null)", vc ? vc : ""));
+				if (fn && (strstr(fn, "Runway") || strstr(fn, "LiveCutScene")) && v && PlausiblePtr((uint64_t)v))
+					tables.emplace_back(fn, v);
+			}
+			for (auto& kv : tables)
+				DumpTableRows(kv.second, kv.first.c_str(),
+					NameHas(kv.first.c_str(), { "LiveCutScene" }) ? 400 : 1000);
+
+			ToMaster("=== MstEvent runway rows (all fields) ===");
+			for (auto& r : EventDates::g_runwayRows) {
+				ToMaster(std::format("-- event row id={} @ {}", r.first, PtrStr(r.second)));
+				ReflectDump(r.second, 1, "MstEvent", false);
+			}
+			ToMaster("=== v21 master dump complete ===");
+		}
+
+		// v22: last runway event id seen by RunwayUnitConfirmationModel ctor
+		int g_lastEventId = 0;   // [DIAG] v22
+
+		// v22: runtime scene override test switch (env SCSP_RUNWAY_SCENE=900_DressO_Summer etc.)
+		void ForceSceneName(Il2CppObject* data) {
+			static std::string forced = [] {
+				const char* v = getenv("SCSP_RUNWAY_SCENE");
+				return v ? std::string(v) : std::string();
+			}();
+			if (forced.empty() || !data) return;
+			try {
+				auto k = ClassOf(data);
+				const char* cn = k ? il2cpp_class_get_name(k) : nullptr;
+				if (!cn || !strstr(cn, "RunwayEventStartData")) return;
+				auto fi = il2cpp_symbols_logged::il2cpp_class_get_field_from_name(k, "<SceneName>k__BackingField");
+				if (!fi) { ToRuntime("[scene-force] <SceneName> field not found"); return; }
+				auto s = il2cpp_string_new(forced.c_str());
+				il2cpp_symbols::write_field<Il2CppString*>(data, fi, s);
+				ToRuntime(std::format("[scene-force] SceneName -> \"{}\"", forced));
+			}
+			catch (...) {}
+		}
+
+		// runtime: every RunwayEventStartData handed to PreLoadAsync
+		void DumpStartData(Il2CppObject* data) {
+			if (!data) return;
+			try {
+				auto k = ClassOf(data);
+				const char* cn = k ? il2cpp_class_get_name(k) : nullptr;
+				if (!cn) return;
+				const bool runway = NameHas(cn, { "Runway" });
+				const bool startData = NameHas(cn, { "StartData" });
+				if (!runway && !startData) return;
+				if (!runway && g_startDataClasses >= 2) return;
+				static std::unordered_set<uintptr_t> seen;
+				if (!seen.insert((uintptr_t)data).second) return;
+				if (seen.size() > 200) return;
+				if (!runway) g_startDataClasses++;
+				ToRuntime(std::format("=== start data #{} {} event={} @ {} ===",
+					(int)seen.size(), cn, g_lastEventId, PtrStr(data)));
+				ReflectDump(data, 4, cn, true);
+			}
+			catch (...) {}
+		}
+	}
+
+	// v13: the four MstEvent getter hooks were removed - those addresses are
+	// ICF-shared with unrelated methods and hooking them crashed the game
+	// (GameAssembly.dll+0x20af266).  All date inspection is pure field reads.
+
 	HOOK_ORIG_TYPE DioramaProductViewModel_IsLocked_orig;
 	bool DioramaProductViewModel_IsLocked_hook(void* self) {
 		if (g_unlock_photo_studio) {
@@ -1225,6 +1950,124 @@ namespace
 		dumpedTextureNames.emplace(strTextureName);
 
 		return strTextureName;
+	}
+
+	// =====================================================================
+	// [DIAG] v23 - runway scene discovery: while a runway run is playing,
+	// scan loaded TMP texts + textures, log names/texts to
+	// runway-runtime-dump.txt and export candidate textures as PNG into
+	// TextureDump/scene-scan/ so the wall/screen art source can be identified.
+	// =====================================================================
+	namespace RunwaySceneScan {
+		int g_countdown = -1;
+		int g_pass = 0;
+		int g_dumped = 0;
+		std::unordered_set<uintptr_t> g_seenTmp;
+		std::unordered_set<uintptr_t> g_seenTex;
+		std::unordered_set<std::string> g_seenNames;
+		std::vector<void*> g_dumpQueue;
+
+		void Log(const std::string& l) { RunwayDump::ToRuntime(l); }
+
+		bool NameHasAny(const std::string& s, std::initializer_list<const char*> keys) {
+			for (auto k : keys) if (s.find(k) != std::string::npos) return true;
+			return false;
+		}
+
+		Il2CppArray* FindAllOfType(void* k) {
+			static auto m = il2cpp_symbols_logged::get_method("UnityEngine.CoreModule.dll", "UnityEngine", "Resources", "FindObjectsOfTypeAll", 1);
+			if (!m || !m->methodPointer || !k) return nullptr;
+			auto type = il2cpp_type_get_object(il2cpp_class_get_type(k));
+			if (!type) return nullptr;
+			return m->Invoke<Il2CppArray*>(nullptr, { (Il2CppObject*)type });
+		}
+
+		std::string ObjName(void* obj) {
+			static auto getName = il2cpp_symbols_logged::get_method("UnityEngine.CoreModule.dll", "UnityEngine", "Object", "get_name", 0);
+			if (!getName || !getName->methodPointer) return "";
+			auto s = getName->Invoke<Il2CppString*>((Il2CppObject*)obj, {});
+			return s ? s->ToUtf8String() : std::string();
+		}
+
+		void ScanTmpClass(const char* cls) {
+			auto k = il2cpp_symbols_logged::get_class("Unity.TextMeshPro.dll", "TMPro", cls);
+			if (!k) { Log(std::format("  [tmp-scan] {} class NOT FOUND", cls)); return; }
+			auto getText = il2cpp_class_get_method_from_name(k, "get_text", 0);
+			auto arr = FindAllOfType(k);
+			int n = arr ? RunwayDump::ArrayLength(arr) : 0;
+			int cap = n > 400 ? 400 : n;
+			int matched = 0;
+			for (int i = 0; i < cap; i++) {
+				void* obj = *reinterpret_cast<void**>(RunwayDump::ArrayElem(arr, i, 8));
+				if (!obj) continue;
+				if (!g_seenTmp.insert((uintptr_t)obj).second) continue;
+				std::string txt;
+				if (getText && getText->methodPointer) {
+					auto ts = getText->Invoke<Il2CppString*>((Il2CppObject*)obj, {});
+					if (ts) txt = ts->ToUtf8String();
+				}
+				if (NameHasAny(txt, { "ShowPiece", "Shiny", "SHINY", "Runway", "RUNWAY", "Collection", "2026", "Spring", "Summer", "DressO" })) {
+					matched++;
+					Log(std::format("  [tmp] {} obj=\"{}\" text=\"{}\"", cls, ObjName(obj), txt));
+				}
+			}
+			Log(std::format("  [tmp-scan] {} loaded={} scannedNew={} matched={}", cls, n, cap, matched));
+		}
+
+		void ScanTextures(const char* cls) {
+			auto k = il2cpp_symbols_logged::get_class("UnityEngine.CoreModule.dll", "UnityEngine", cls);
+			if (!k) { Log(std::format("  [tex-scan] {} NOT FOUND", cls)); return; }
+			auto arr = FindAllOfType(k);
+			int n = arr ? RunwayDump::ArrayLength(arr) : 0;
+			int cap = n > 800 ? 800 : n;
+			int matched = 0;
+			for (int i = 0; i < cap; i++) {
+				void* obj = *reinterpret_cast<void**>(RunwayDump::ArrayElem(arr, i, 8));
+				if (!obj) continue;
+				if (!g_seenTex.insert((uintptr_t)obj).second) continue;
+				std::string nm = ObjName(obj);
+				if (nm.empty()) continue;
+				if (g_seenNames.insert(nm).second)
+					Log(std::format("  [tex-name] {} {}", cls, nm));
+				if (NameHasAny(nm, { "DressO", "Logo", "Title", "ShowPiece", "Wall", "Screen", "Board", "Banner", "Panel", "Sign", "Monitor", "2026", "Runway", "Label" })) {
+					matched++;
+					if (g_dumped + (int)g_dumpQueue.size() < 24) g_dumpQueue.push_back(obj);
+				}
+			}
+			Log(std::format("  [tex-scan] {} loaded={} scannedNew={} matched={}", cls, n, cap, matched));
+		}
+
+		void TickSceneScan() {
+			if (!g_dumpQueue.empty()) {
+				void* ptr = g_dumpQueue.front();
+				g_dumpQueue.erase(g_dumpQueue.begin());
+				try {
+					g_dumped++;
+					DumpTexture2D((Il2CppObject*)ptr, "scene-scan");
+				}
+				catch (...) {}
+				return;
+			}
+			if (g_countdown < 0) return;
+			if (g_countdown > 0) { g_countdown--; return; }
+			g_pass++;
+			Log(std::format("=== runway scene scan pass {} (event={}) ===", g_pass, RunwayDump::g_lastEventId));
+			try {
+				ScanTmpClass("TextMeshProUGUI");
+				ScanTmpClass("TextMeshPro");
+				ScanTextures("Texture2D");
+				ScanTextures("RenderTexture");
+			}
+			catch (...) { Log("  [scene-scan] error during scan"); }
+			if (g_pass == 1) g_countdown = 1800;
+			else { g_countdown = -1; Log("=== runway scene scan done ==="); }
+		}
+
+		void ArmSceneScan() {
+			g_countdown = 900;
+			g_pass = 0;
+			Log(std::format("[scene-scan] armed (event={})", RunwayDump::g_lastEventId));
+		}
 	}
 
 	void DumpSprite(Il2CppObject* sprite, std::string sourceType) {
@@ -2001,7 +2844,7 @@ namespace
 	//	HOOK_CAST_CALL(void, PostProcess_DepthOfFieldClip_CreatePlayable)(retstr, _this, graph, go, mtd);
 	//}
 
-	// 已过时
+	// 已过�?
 	HOOK_ORIG_TYPE Live_SetEnableDepthOfField_orig;
 	void Live_SetEnableDepthOfField_hook(void* _this, bool isEnable) {
 		if (g_enable_free_camera) {
@@ -2019,7 +2862,9 @@ namespace
 		}
 	}
 
-#ifdef __OBSOLETE_HOOK__
+	// [PATCH] __OBSOLETE_HOOK__ guard removed - this block declares the globals
+	// (confirmationingModel / cacheDressMap / cacheHairMap / cacheAccessoryMap) that the
+	// costume-unlock code further below needs.
 	bool isCancelTryOn = false;
 	HOOK_ORIG_TYPE LiveCostumeChangeView_setTryOnMode_orig;
 	void LiveCostumeChangeView_setTryOnMode_hook(void* _this, void* idol, bool isTryOn) {
@@ -2167,7 +3012,7 @@ namespace
 	std::map<int, void*> cacheAccessoryMap{};
 
 	HOOK_ORIG_TYPE LiveCostumeChangeModel_ctor_orig;
-	void LiveCostumeChangeModel_ctor_hook(void* _this, void* reply, void* idol, int costumeType, bool forceDressOrdered) {  // 添加服装到 dressDic
+	void LiveCostumeChangeModel_ctor_hook(void* _this, void* reply, void* idol, int costumeType, bool forceDressOrdered) {  // 添加服装�?dressDic
 		/*
 		static auto iidol_klass = il2cpp_symbols::get_class_from_instance(idol);
 		static auto get_CharacterId_mtd = il2cpp_class_get_method_from_name(iidol_klass, "get_CharacterId", 0);
@@ -2207,12 +3052,46 @@ namespace
 			// addToDic(cacheAccessoryMap, accessoryDic);  // TODO PRISM.ResourceManagement.ResourceLoader._throwMissingKeyException
 		}
 	}
-#endif
+	// [PATCH] #endif removed (matching the #ifdef __OBSOLETE_HOOK__ that was deleted above)
 
+
+	// [DIAG] v32 - solo index mapping experiment.  The ctor gets the index of
+	// the selected character in the *pre-sort* lineup, but the vocal stem /
+	// post-load lineup may use another order.  Log the candidate orders and
+	// optionally write the mapped index back into the LiveMVStartData field.
+	namespace SoloUnlock {
+		int ReadSongIdFromMvStage(void* mvStage);
+		std::string ReadMvSceneFromMvStage(void* mvStage);
+		void DumpSongPartsForSong(int songId);
+		void ApplySoloIndexMap(void* _this, void* onStageIdols, int origIndex, int charaId, int songId);
+		void RememberStartData(void* data, int origIndex, int charaId, int songId);
+		void RemapAtPreLoad(void* data, void* onStageIdols);
+	}
+
+	int g_lastSoloVocalMode = -1;
+	int g_lastSoloVocalIndex = -1;
+	int g_lastSoloIsSortIdols = 0;
+	int g_soloPositionLogCalls = 0;
 
 	void ModifyOnStageIdols(void* onStageIdols) {
+		FILE* soloLog = nullptr;
 		__try {
 			auto idolsLength = il2cpp_array_length(onStageIdols);
+			if (g_soloPositionLogCalls++ < 100) {
+				soloLog = fopen("solo-unlock.txt", "a");
+				if (soloLog) {
+					fprintf(soloLog, "[v31] lineup mode=%d soloIndex=%d sortIdols=%d positions=[",
+						g_lastSoloVocalMode, g_lastSoloVocalIndex, g_lastSoloIsSortIdols);
+					for (int i = 0; i < idolsLength && i < 32; ++i) {
+						auto idol = (managed::UnitIdol*)il2cpp_symbols::array_get_value(onStageIdols, i);
+						fprintf(soloLog, "%s%d:%d", i ? "," : "", i,
+							idol ? UnitIdol::GetCharaId(idol) : -1);
+					}
+					fprintf(soloLog, "]\n");
+					fclose(soloLog);
+					soloLog = nullptr;
+				}
+			}
 			if (g_save_and_replace_costume_changes) {
 				for (int i = 0; i < idolsLength; i++) {
 					auto item = (managed::UnitIdol*)il2cpp_symbols::array_get_value(onStageIdols, i);
@@ -2239,16 +3118,52 @@ namespace
 			}
 		}
 		__except (seh_filter(GetExceptionInformation())) {
+			if (soloLog) fclose(soloLog);
 			printf("SEH exception detected in `ModifyOnStageIdols`.\n");
 		}
 	}
 
 	HOOK_ORIG_TYPE LiveMVStartData_ctor_orig;
 	void LiveMVStartData_ctor_hook(void* _this, void* mvStage, void* sceneName, void* onStageIdols, void* cameraworkConfig, int vocalSeparatedMode, int vocalSeparatedSoloIndex, int renderingDynamicRange, int soundEffectMode, bool isSortIdols) {
+		// [DIAG] v31 - scalar-only logging; do not inspect managed arguments here.
+		g_lastSoloVocalMode = vocalSeparatedMode;
+		g_lastSoloVocalIndex = vocalSeparatedSoloIndex;
+		g_lastSoloIsSortIdols = isSortIdols ? 1 : 0;
+
+		int selectedCharaId = -1;
+		int mvSongId = -1;
+		std::string mvScene;
+		try { mvSongId = SoloUnlock::ReadSongIdFromMvStage(mvStage); } catch (...) {}
+		try { mvScene = SoloUnlock::ReadMvSceneFromMvStage(mvStage); } catch (...) {}
+		try {
+			auto idolsLength = onStageIdols ? il2cpp_array_length(onStageIdols) : 0;
+			if (onStageIdols && vocalSeparatedSoloIndex >= 0 && (uint32_t)vocalSeparatedSoloIndex < idolsLength) {
+				auto idol = (managed::UnitIdol*)il2cpp_symbols::array_get_value(onStageIdols, vocalSeparatedSoloIndex);
+				if (idol) selectedCharaId = UnitIdol::GetCharaId(idol);
+			}
+		} catch (...) {}
+		try { SoloUnlock::DumpSongPartsForSong(mvSongId); } catch (...) {}
+		try { SoloUnlock::RememberStartData(_this, vocalSeparatedSoloIndex, selectedCharaId, mvSongId); } catch (...) {}
+
+		static int soloStartDataLogs = 0;
+		if (soloStartDataLogs++ < 100) {
+			FILE* f = fopen("solo-unlock.txt", "a");
+			if (f) {
+				fprintf(f, "[v31] LiveMVStartData mode=%d soloIndex=%d sortIdols=%d mvStage=%p sceneName=%p onStageIdols=%p camerawork=%p\n",
+					vocalSeparatedMode, vocalSeparatedSoloIndex, isSortIdols ? 1 : 0,
+					mvStage, sceneName, onStageIdols, cameraworkConfig);
+				fprintf(f, "[v32] start song=%d scene=\"%s\" mode=%d soloIndex=%d chara=%d\n",
+					mvSongId, mvScene.c_str(), vocalSeparatedMode, vocalSeparatedSoloIndex, selectedCharaId);
+				fclose(f);
+			}
+		}
 		if (g_override_isVocalSeparatedOn) {
 			vocalSeparatedMode = 1;
 		}
 		HOOK_CAST_CALL(void*, LiveMVStartData_ctor)(_this, mvStage, sceneName, onStageIdols, cameraworkConfig, vocalSeparatedMode, vocalSeparatedSoloIndex, renderingDynamicRange, soundEffectMode, isSortIdols);
+		if (selectedCharaId >= 0) {
+			try { SoloUnlock::ApplySoloIndexMap(_this, onStageIdols, vocalSeparatedSoloIndex, selectedCharaId, mvSongId); } catch (...) {}
+		}
 	}
 
 	void* GetLiveStartDataOnStageIdols(Il2CppObject* data) {
@@ -2258,7 +3173,6 @@ namespace
 		);
 		return method_get_OnStageIdols->Invoke(data, {});
 	}
-
 	Il2CppObject* CreateRunwayMotionInstanceOrDefault(int id) {
 		if (id <= 0) return nullptr;
 
@@ -2380,10 +3294,19 @@ namespace
 
 	HOOK_ORIG_TYPE LiveStartDataExtensions_PreLoadAsync_orig;
 	void* LiveStartDataExtensions_PreLoadAsync_hook(void* retstr, Il2CppObject* data, const MethodInfo* method) {
+		RunwayDump::ForceSceneName(data);   // [TEST] v22 - env-driven scene override
+		RunwayDump::DumpStartData(data);   // [DIAG] v21 - runway start data field dump
+		try {   // [DIAG] v23 - arm the runway scene scan for runway runs
+			auto cls = RunwayDump::ClassOf(data);
+			const char* cn = cls ? il2cpp_class_get_name(cls) : nullptr;
+			if (cn && strstr(cn, "Runway")) RunwaySceneScan::ArmSceneScan();
+		}
+		catch (...) {}
 		auto onStageIdols = GetLiveStartDataOnStageIdols(data);
 		if (onStageIdols != nullptr) {
 			ModifyOnStageIdols(onStageIdols);
 		}
+		try { SoloUnlock::RemapAtPreLoad(data, onStageIdols); } catch (...) {}
 		if (g_override_runway_motion) {
 			for (int i = 0; i < overrideRunwayMotionData.size(); ++i) {
 				OverrideRunwayStartData(data, i, overrideRunwayMotionData[i].WalkingMotionId, overrideRunwayMotionData[i].PoseMotionId);
@@ -2452,7 +3375,1640 @@ namespace
 	}
 
 	HOOK_ORIG_TYPE MainThreadDispatcher_LateUpdate_orig;
+	static bool g_saveAuditScanComplete = false;
+
+	static std::string ToLowerAscii(std::string value) {
+		for (char& c : value) {
+			if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+		}
+		return value;
+	}
+
+	static bool IsSaveAuditType(const char* namespaze, const char* className) {
+		std::string typeName;
+		if (namespaze) typeName += namespaze;
+		typeName += "::";
+		if (className) typeName += className;
+		typeName = ToLowerAscii(std::move(typeName));
+		return typeName.find("sqlite") != std::string::npos
+			|| typeName.find("database") != std::string::npos
+			|| typeName.find("savedata") != std::string::npos
+			|| typeName.find("userdata") != std::string::npos
+			|| typeName.find("localdata") != std::string::npos
+			|| typeName.find("masterdata") != std::string::npos
+			|| typeName.find("emberbox") != std::string::npos;
+	}
+
+	static void DumpSaveAuditMethodSignatures() {
+		std::ofstream output("save-audit-methods.txt", std::ios::trunc);
+		if (!output.is_open()) {
+			printf("[save-audit] Cannot create save-audit-methods.txt\n");
+			return;
+		}
+
+		output << "SCSP save-path metadata scan\n"
+			<< "Method/type signatures only; no arguments, object values, or save files are read.\n\n";
+
+		size_t assemblyCount = 0;
+		auto** assemblies = il2cpp_domain_get_assemblies(il2cpp_domain_get(), &assemblyCount);
+		size_t matchedTypes = 0;
+		size_t writtenMethods = 0;
+		constexpr size_t maxTypes = 500;
+		constexpr size_t maxMethods = 5000;
+
+		for (size_t a = 0; assemblies && a < assemblyCount && matchedTypes < maxTypes && writtenMethods < maxMethods; ++a) {
+			auto* image = il2cpp_assembly_get_image((void*)assemblies[a]);
+			if (!image) continue;
+			const size_t classCount = il2cpp_image_get_class_count(image);
+			for (size_t i = 0; i < classCount && matchedTypes < maxTypes && writtenMethods < maxMethods; ++i) {
+				auto* klass = il2cpp_image_get_class(image, i);
+				if (!klass) continue;
+				const char* namespaze = il2cpp_class_get_namespace((void*)klass);
+				const char* className = il2cpp_class_get_name((void*)klass);
+				if (!IsSaveAuditType(namespaze, className)) continue;
+
+				++matchedTypes;
+				output << "TYPE " << (namespaze ? namespaze : "") << "::"
+					<< (className ? className : "?") << "\n";
+				void* iter = nullptr;
+				const MethodInfo* method = nullptr;
+				while ((method = il2cpp_class_get_methods((void*)klass, &iter)) && writtenMethods < maxMethods) {
+					output << "  " << debug::FormatMethodInfo(method) << "\n";
+					++writtenMethods;
+				}
+				output << "\n";
+			}
+		}
+
+		output << "SUMMARY assemblies=" << assemblyCount
+			<< " matchedTypes=" << matchedTypes
+			<< " methods=" << writtenMethods << "\n";
+		output.close();
+		printf("[save-audit] Wrote %zu type(s), %zu method signature(s) to save-audit-methods.txt\n",
+			matchedTypes, writtenMethods);
+	}
+
+	// ============================================================================
+	// [DIAG] v15 - PRISM view-connector / viewMapping diagnostics (read-only).
+	// ErrorCode[8E0AC0DA] == CRC32("IRunwayUnitConfirmationConnector"): produced by
+	// BootMenuScene._toErrorCode() when a view jump cannot be resolved. These hooks
+	// only log state (viewMapping content, jump targets, connector lifetime,
+	// exceptions); they never modify game data.
+	// ============================================================================
+	namespace ViewDiag {
+		void* g_bootMenuScene = nullptr;
+
+		std::string timestamp() {
+			const auto ms = GetTickCount64();
+			return "[" + std::to_string((unsigned long long)(ms / 1000)) + "." + std::to_string((unsigned long long)(ms % 1000)) + "]";
+		}
+
+		std::string ptr_str(const void* p) {
+			return std::format("{:p}", (void*)p);
+		}
+
+		std::string il2cpp_to_utf8(Il2CppString* s) {
+			if (!s) return "(null)";
+			try {
+				return utility::conversions::to_utf8string(s->toWstring());
+			}
+			catch (...) {
+				return "(convert-error)";
+			}
+		}
+
+		void appendLog(const char* fileName, const std::string& line) {
+			try {
+				std::ofstream f(fileName, std::ios::app);
+				if (f.is_open()) f << line << "\n";
+			}
+			catch (...) {}
+		}
+
+		void* find_class_anywhere(const char* namespaze, const char* className) {
+			size_t count = 0;
+			auto** assemblies = il2cpp_domain_get_assemblies(il2cpp_domain_get(), &count);
+			for (size_t i = 0; assemblies && i < count; ++i) {
+				auto* image = il2cpp_assembly_get_image((void*)assemblies[i]);
+				if (!image) continue;
+				auto* klass = il2cpp_class_from_name(image, namespaze, className);
+				if (klass) return klass;
+			}
+			return nullptr;
+		}
+
+		void* find_method_anywhere(const char* namespaze, const char* className, const char* methodName, int paramCount) {
+			auto* klass = find_class_anywhere(namespaze, className);
+			if (!klass) return nullptr;
+			auto* method = il2cpp_class_get_method_from_name(klass, methodName, paramCount);
+			return method ? (void*)method->methodPointer : nullptr;
+		}
+
+		void* find_nested_move_next(const char* namespaze, const char* outerClassName, const char* nestedClassName) {
+			auto* outer = (Il2CppClass*)find_class_anywhere(namespaze, outerClassName);
+			if (!outer) return nullptr;
+			auto* nested = il2cpp_symbols::get_nested_class(outer, nestedClassName);
+			if (!nested) return nullptr;
+			auto* method = il2cpp_class_get_method_from_name(nested, "MoveNext", 0);
+			return method ? (void*)method->methodPointer : nullptr;
+		}
+
+		std::string reflection_type_name(Il2CppReflectionType* type) {
+			if (!type) return "(null-type)";
+			try {
+				auto* klass = il2cpp_class_from_system_type(type);
+				if (!klass) return "(unresolved-type)";
+				const char* ns = il2cpp_class_get_namespace(klass);
+				const char* name = il2cpp_class_get_name(klass);
+				std::string result;
+				if (ns && *ns) { result += ns; result += "."; }
+				result += (name ? name : "?");
+				return result;
+			}
+			catch (...) {
+				return "(type-error)";
+			}
+		}
+
+		void DumpViewMapping(const char* reason) {
+			const std::string head = timestamp() + " dump(" + std::string(reason) + ")";
+			try {
+				if (!g_bootMenuScene) {
+					appendLog("viewmap-dump.txt", head + " SKIP: BootMenuScene instance not captured yet");
+					return;
+				}
+				auto* scene_klass = find_class_anywhere("PRISM.Boot", "BootMenuScene");
+				if (!scene_klass) { appendLog("viewmap-dump.txt", head + " SKIP: BootMenuScene class not found"); return; }
+				auto* mapping_field = il2cpp_class_get_field_from_name(scene_klass, "viewMapping");
+				if (!mapping_field) { appendLog("viewmap-dump.txt", head + " SKIP: viewMapping field not found"); return; }
+				auto* dict = il2cpp_symbols::read_field<Il2CppObject*>(g_bootMenuScene, mapping_field);
+				if (!dict) { appendLog("viewmap-dump.txt", head + " viewMapping=NULL"); return; }
+
+				auto* dict_klass = il2cpp_symbols::get_system_class_from_reflection_type_str(
+					"System.Collections.Generic.Dictionary`2[System.String, PRISM.ViewBundle]");
+				if (!dict_klass) { appendLog("viewmap-dump.txt", head + " SKIP: Dictionary<string,ViewBundle> type unresolved"); return; }
+
+				auto* entries_field = il2cpp_class_get_field_from_name(dict_klass, "_entries");
+				auto* count_field = il2cpp_class_get_field_from_name(dict_klass, "_count");
+				auto* entry_klass = (void*)il2cpp_symbols::get_nested_class((Il2CppClass*)dict_klass, "Entry");
+				auto* key_field = entry_klass ? il2cpp_class_get_field_from_name(entry_klass, "key") : nullptr;
+				auto* value_field = entry_klass ? il2cpp_class_get_field_from_name(entry_klass, "value") : nullptr;
+				auto* bundle_klass = find_class_anywhere("PRISM", "ViewBundle");
+				auto* b_typeName_field = bundle_klass ? il2cpp_class_get_field_from_name(bundle_klass, "typeName") : nullptr;
+				auto* b_reference_field = bundle_klass ? il2cpp_class_get_field_from_name(bundle_klass, "reference") : nullptr;
+				auto* b_tags_field = bundle_klass ? il2cpp_class_get_field_from_name(bundle_klass, "tags") : nullptr;
+
+				if (!entries_field || !count_field) {
+					appendLog("viewmap-dump.txt", head + " SKIP: dictionary internals unresolved");
+					return;
+				}
+
+				// Entry<string,ViewBundle> layout: hashCode@0, next@4, key@8, value@0x10.
+				int key_off = 0x8;
+				int value_off = 0x10;
+				if (key_field && value_field) {
+					key_off = key_field->offset;
+					value_off = value_field->offset;
+				}
+
+				auto* entries = il2cpp_symbols::read_field<Il2CppObject*>(dict, entries_field);
+				const int count = il2cpp_symbols::read_field<int>(dict, count_field);
+				const int stride = value_off + (int)sizeof(void*);
+
+				std::ofstream f("viewmap-dump.txt", std::ios::app);
+				if (!f.is_open()) return;
+				f << head << " COUNT=" << count << "\n";
+				if (entries) {
+					for (int i = 0; i < count; ++i) {
+						const char* entry = il2cpp_array_addr_with_size(entries, stride, i);
+						auto* key = *(Il2CppString**)(entry + key_off);
+						auto* bundle = *(void**)(entry + value_off);
+						f << "  [" << i << "] " << il2cpp_to_utf8(key);
+						if (bundle && b_typeName_field) {
+							auto* typeName = il2cpp_symbols::read_field<Il2CppString*>(bundle, b_typeName_field);
+							auto* reference = b_reference_field ? il2cpp_symbols::read_field<Il2CppString*>(bundle, b_reference_field) : nullptr;
+							f << "  typeName=" << il2cpp_to_utf8(typeName) << "  ref=" << il2cpp_to_utf8(reference);
+							if (b_tags_field) {
+								auto* tags = il2cpp_symbols::read_field<Il2CppObject*>(bundle, b_tags_field);
+								if (tags) {
+									const int tagCount = *(int*)((char*)tags + 0x18);
+									f << "  tags=[";
+									for (int t = 0; t < tagCount && t < 16; ++t) {
+										auto* tag = *(Il2CppString**)il2cpp_array_addr_with_size(tags, (int)sizeof(void*), t);
+										if (t) f << ",";
+										f << il2cpp_to_utf8(tag);
+									}
+									f << "]";
+								}
+							}
+						}
+						else if (bundle) {
+							f << "  (ViewBundle fields unresolved, obj=" << ptr_str(bundle) << ")";
+						}
+						f << "\n";
+					}
+				}
+				f.close();
+			}
+			catch (...) {
+				appendLog("viewmap-dump.txt", head + " EXCEPTION during dump");
+			}
+		}
+
+		HOOK_ORIG_TYPE BootMenuScene_Start_MoveNext_orig;
+		void BootMenuScene_Start_MoveNext_hook(void* _this) {
+			try {
+				if (_this && !g_bootMenuScene) {
+					auto* scene = *(void**)((char*)_this + 0x10);
+					if (scene) {
+						g_bootMenuScene = scene;
+						appendLog("viewmap-dump.txt", timestamp() + " BootMenuScene instance captured from <Start>d__0.MoveNext obj=" + ptr_str(scene));
+					}
+				}
+			}
+			catch (...) {}
+			return HOOK_CAST_CALL(void, BootMenuScene_Start_MoveNext)(_this);
+		}
+
+		HOOK_ORIG_TYPE BootMenuScene_SelectView_MoveNext_orig;
+		void BootMenuScene_SelectView_MoveNext_hook(void* _this) {
+			try {
+				if (_this) {
+					const int state = *(int*)((char*)_this + 0x0);
+					auto* scene = *(void**)((char*)_this + 0x20);
+					if (scene && !g_bootMenuScene) g_bootMenuScene = scene;
+					if (state == 0) {
+						auto* viewType = *(Il2CppReflectionType**)((char*)_this + 0x28);
+						appendLog("view-select-log.txt", timestamp() + " _selectViewAsync viewType=" + reflection_type_name(viewType));
+					}
+				}
+			}
+			catch (...) {}
+			return HOOK_CAST_CALL(void, BootMenuScene_SelectView_MoveNext)(_this);
+		}
+
+		HOOK_ORIG_TYPE BootMenuScene_setupView_orig;
+		int BootMenuScene_setupView_hook(void* _this) {
+			try {
+				if (_this && !g_bootMenuScene) {
+					g_bootMenuScene = _this;
+					appendLog("viewmap-dump.txt", timestamp() + " BootMenuScene instance captured from _setupView obj=" + ptr_str(_this));
+				}
+			}
+			catch (...) {}
+			return HOOK_CAST_CALL(int, BootMenuScene_setupView)(_this);
+		}
+
+		HOOK_ORIG_TYPE BootMenuScene_getViewBundles_orig;
+		void* BootMenuScene_getViewBundles_hook(void* _this) {
+			try {
+				if (_this && !g_bootMenuScene) g_bootMenuScene = _this;
+				appendLog("viewmap-dump.txt", timestamp() + " _getViewBundles called");
+			}
+			catch (...) {}
+			return HOOK_CAST_CALL(void*, BootMenuScene_getViewBundles)(_this);
+		}
+
+		HOOK_ORIG_TYPE BootMenuScene_toErrorCode_orig;
+		Il2CppString* BootMenuScene_toErrorCode_hook(Il2CppString* viewType) {
+			try {
+				appendLog("view-error-log.txt", timestamp() + " _toErrorCode viewType=" + il2cpp_to_utf8(viewType));
+				DumpViewMapping("toErrorCode");
+			}
+			catch (...) {}
+			return HOOK_CAST_CALL(Il2CppString*, BootMenuScene_toErrorCode)(viewType);
+		}
+
+		HOOK_ORIG_TYPE BootMenuScene_onViewErrorAsync_orig;
+		void BootMenuScene_onViewErrorAsync_hook(void* retBuf, void* exception) {
+			try {
+				std::string detail = "(null)";
+				if (exception) {
+					auto* klass = il2cpp_symbols::get_class_from_instance(exception);
+					if (klass) {
+						const char* ns = il2cpp_class_get_namespace(klass);
+						const char* name = il2cpp_class_get_name(klass);
+						detail = std::string(ns ? ns : "") + "." + (name ? name : "?");
+						auto* toString = il2cpp_class_get_method_from_name(klass, "ToString", 0);
+						if (toString) {
+							auto fn = reinterpret_cast<Il2CppString* (*)(void*)>(toString->methodPointer);
+							detail += " msg=" + il2cpp_to_utf8(fn(exception));
+						}
+					}
+				}
+				appendLog("view-error-log.txt", timestamp() + " _onViewErrorAsync exception=" + detail);
+				DumpViewMapping("onViewError");
+			}
+			catch (...) {}
+			return HOOK_CAST_CALL(void, BootMenuScene_onViewErrorAsync)(retBuf, exception);
+		}
+
+		HOOK_ORIG_TYPE BootMenuScene_LoadViewAssetAsync_orig;
+		void BootMenuScene_LoadViewAssetAsync_hook(void* retBuf, void* _this, Il2CppString* viewName, void* resourceLoader) {
+			try {
+				appendLog("view-asset-log.txt", timestamp() + " LoadViewAssetAsync viewName=" + il2cpp_to_utf8(viewName));
+			}
+			catch (...) {}
+			return HOOK_CAST_CALL(void, BootMenuScene_LoadViewAssetAsync)(retBuf, _this, viewName, resourceLoader);
+		}
+
+		HOOK_ORIG_TYPE ViewManager_JumpView_orig;
+		void ViewManager_JumpView_hook(void* _this, Il2CppReflectionType* viewType, bool withFade, void* param, int stackOperation) {
+			try {
+				appendLog("view-jump-log.txt", timestamp() + " JumpView viewType=" + reflection_type_name(viewType)
+					+ " withFade=" + (withFade ? "1" : "0") + " stackOperation=" + std::to_string(stackOperation));
+			}
+			catch (...) {}
+			return HOOK_CAST_CALL(void, ViewManager_JumpView)(_this, viewType, withFade, param, stackOperation);
+		}
+
+		HOOK_ORIG_TYPE ViewManager_JumpViewAsync_orig;
+		void ViewManager_JumpViewAsync_hook(void* retBuf, void* _this, Il2CppReflectionType* viewType, bool withFade, void* param, int stackOperation) {
+			try {
+				appendLog("view-jump-log.txt", timestamp() + " JumpViewAsync viewType=" + reflection_type_name(viewType)
+					+ " withFade=" + (withFade ? "1" : "0") + " stackOperation=" + std::to_string(stackOperation));
+			}
+			catch (...) {}
+			return HOOK_CAST_CALL(void, ViewManager_JumpViewAsync)(retBuf, _this, viewType, withFade, param, stackOperation);
+		}
+
+		HOOK_ORIG_TYPE RunwayEventTopConnector_ctor_orig;
+		void RunwayEventTopConnector_ctor_hook(void* _this) {
+			try { appendLog("runway-connector-log.txt", timestamp() + " RunwayEventTopConnector..ctor obj=" + ptr_str(_this)); } catch (...) {}
+			return HOOK_CAST_CALL(void, RunwayEventTopConnector_ctor)(_this);
+		}
+
+		HOOK_ORIG_TYPE RunwayEventTopConnector_ParseFromLegacy_orig;
+		void* RunwayEventTopConnector_ParseFromLegacy_hook(void* _this, void* parameter) {
+			try { appendLog("runway-connector-log.txt", timestamp() + " RunwayEventTopConnector.ParseFromLegacy param=" + ptr_str(parameter)); } catch (...) {}
+			return HOOK_CAST_CALL(void*, RunwayEventTopConnector_ParseFromLegacy)(_this, parameter);
+		}
+
+		HOOK_ORIG_TYPE RunwayUnitConfirmationConnector_ctor_orig;
+		void RunwayUnitConfirmationConnector_ctor_hook(void* _this) {
+			try { appendLog("runway-connector-log.txt", timestamp() + " RunwayUnitConfirmationConnector..ctor obj=" + ptr_str(_this)); } catch (...) {}
+			return HOOK_CAST_CALL(void, RunwayUnitConfirmationConnector_ctor)(_this);
+		}
+
+		HOOK_ORIG_TYPE RunwayUnitConfirmationConnector_ParseFromLegacy_orig;
+		void* RunwayUnitConfirmationConnector_ParseFromLegacy_hook(void* _this, void* parameter) {
+			try { appendLog("runway-connector-log.txt", timestamp() + " RunwayUnitConfirmationConnector.ParseFromLegacy param=" + ptr_str(parameter)); } catch (...) {}
+			return HOOK_CAST_CALL(void*, RunwayUnitConfirmationConnector_ParseFromLegacy)(_this, parameter);
+		}
+
+		void Tick() {
+			static ULONGLONG startTick = 0;
+			static int stage = 0;
+			if (!startTick) startTick = GetTickCount64();
+			static const ULONGLONG thresholds[] = { 10000, 30000, 90000 };
+			if (stage < 3 && GetTickCount64() - startTick >= thresholds[stage]) {
+				DumpViewMapping(stage == 0 ? "T+10s" : (stage == 1 ? "T+30s" : "T+90s"));
+				++stage;
+			}
+		}
+
+		void InstallHooks() {
+			auto BootMenuScene_Start_MoveNext_addr = find_nested_move_next("PRISM.Boot", "BootMenuScene", "<Start>d__0");
+			auto BootMenuScene_SelectView_MoveNext_addr = find_nested_move_next("PRISM.Boot", "BootMenuScene", "<_selectViewAsync>d__5");
+			auto BootMenuScene_setupView_addr = find_method_anywhere("PRISM.Boot", "BootMenuScene", "_setupView", 0);
+			auto BootMenuScene_getViewBundles_addr = find_method_anywhere("PRISM.Boot", "BootMenuScene", "_getViewBundles", 0);
+			auto BootMenuScene_toErrorCode_addr = find_method_anywhere("PRISM.Boot", "BootMenuScene", "_toErrorCode", 1);
+			auto BootMenuScene_onViewErrorAsync_addr = find_method_anywhere("PRISM.Boot", "BootMenuScene", "_onViewErrorAsync", 1);
+			auto BootMenuScene_LoadViewAssetAsync_addr = find_method_anywhere("PRISM.Boot", "BootMenuScene", "LoadViewAssetAsync", 2);
+			auto ViewManager_JumpView_addr = find_method_anywhere("ENTERPRISE", "ViewManager", "JumpView", 4);
+			auto ViewManager_JumpViewAsync_addr = find_method_anywhere("ENTERPRISE", "ViewManager", "JumpViewAsync", 4);
+			auto RunwayEventTopConnector_ctor_addr = find_method_anywhere("PRISM.Interactions", "RunwayEventTopConnector", ".ctor", 0);
+			auto RunwayEventTopConnector_ParseFromLegacy_addr = find_method_anywhere("PRISM.Interactions", "RunwayEventTopConnector", "ParseFromLegacy", 1);
+			auto RunwayUnitConfirmationConnector_ctor_addr = find_method_anywhere("PRISM.Interactions", "RunwayUnitConfirmationConnector", ".ctor", 0);
+			auto RunwayUnitConfirmationConnector_ParseFromLegacy_addr = find_method_anywhere("PRISM.Interactions", "RunwayUnitConfirmationConnector", "ParseFromLegacy", 1);
+
+			ADD_HOOK_1(BootMenuScene_Start_MoveNext);
+			ADD_HOOK_1(BootMenuScene_SelectView_MoveNext);
+			ADD_HOOK_1(BootMenuScene_setupView);
+			ADD_HOOK_1(BootMenuScene_getViewBundles);
+			ADD_HOOK_1(BootMenuScene_toErrorCode);
+			ADD_HOOK_1(BootMenuScene_onViewErrorAsync);
+			ADD_HOOK_1(BootMenuScene_LoadViewAssetAsync);
+			ADD_HOOK_1(ViewManager_JumpView);
+			ADD_HOOK_1(ViewManager_JumpViewAsync);
+			ADD_HOOK_1(RunwayEventTopConnector_ctor);
+			ADD_HOOK_1(RunwayEventTopConnector_ParseFromLegacy);
+			ADD_HOOK_1(RunwayUnitConfirmationConnector_ctor);
+			ADD_HOOK_1(RunwayUnitConfirmationConnector_ParseFromLegacy);
+		}
+	}
+	// =====================================================================
+	// [PATCH] v24 - unlock EVERY song's "vocal separated" (分唱 / solo) parts.
+	//
+	//   Songs that support the part-splitting feature carry that state in the
+	//   master (MstSong + the MasterData.SongPartsCharacters table).  A few
+	//   songs only expose *some* of their characters as selectable solo
+	//   vocals, because the rest are gated behind the "limited song parts"
+	//   unlock (api.LiveService/UnlockLimitedSongParts -> HavingGroup, i.e. a
+	//   product an offline profile can never own).  The client evaluates that
+	//   gate in these two methods:
+	//
+	//     PRISM.Definitions.MstSong::CheckLimitedVocalSeparatedSatisfy() -> bool
+	//     PRISM.Live.MusicData::IsLimitedVocalSeparatedLocked(<arg>)      -> bool
+	//
+	//   v24 replaces ONLY the two return values - no field writes, no master
+	//   mutation, exactly like the v11 event-date fix:
+	//       CheckLimitedVocalSeparatedSatisfy -> true
+	//       IsLimitedVocalSeparatedLocked     -> false
+	//
+	//   Both detours ignore their arguments and never call the original, so a
+	//   wrong parameter guess cannot corrupt the call: they only decide the
+	//   bool that goes back to the caller.  SCSP_SOLO_UNLOCK=0 installs
+	//   nothing at all.
+	//
+	//   SCSP_SOLO_ALL=1 additionally forces
+	//     PRISM.Definitions.MstSong::IsCandidateAllCharacterVocalSeparated()
+	//   -> true (installed only when that env var is set).
+	//
+	//   Diagnostics (append, game root):
+	//     solo-unlock.txt        - install result, every forced call (first 40
+	//                              each) and the class field dump of MstSong /
+	//                              MstSongPartsCharacter / MusicData, so the
+	//                              real master field names of the feature end
+	//                              up on record.
+	//     runway-master-dump.txt - the MasterData.SongPartsCharacters rows and
+	//                              the full field dump of every MstSong row
+	//                              that asked "am I locked?".
+	// =====================================================================
+	namespace SoloUnlock {
+		bool g_enabled = true;      // SCSP_SOLO_UNLOCK=0 -> install nothing
+		// [v27] SCSP_SOLO_ALL_SONGS=1 also opens IsSongParts on songs that do
+		// not have the part feature at all.  Default OFF (v28): only songs that
+		// already report IsSongParts=true get solo, exactly like v26.
+		bool g_allSongs = false;
+		bool g_forceAll = false;    // SCSP_SOLO_ALL=1    -> also force the
+		                            //   "all characters are candidates" check
+		bool g_installed = false;
+		bool g_classDumped = false;
+		bool g_tablesDumped = false;
+		bool g_songsPatched = false;
+		int g_satisfyCalls = 0, g_satisfyMstCalls = 0, g_lockedCalls = 0, g_lockedArgCalls = 0;
+		int g_allCalls = 0, g_songDumps = 0, g_soloFlagCalls = 0, g_validModeCalls = 0;
+		int g_lastSongId = -1;      // [DIAG] v30 - correlate lip tables with the active song row
+		// [DIAG] v32 - part list / HashSet order caches for the solo index map
+		std::vector<int> g_songPartsIds;
+		int g_songPartsSongId = -1;
+		bool g_partMethodsDumped = false;
+		std::vector<int> g_soloVoiceIds;
+		void* g_soloVoiceSet = nullptr;
+		int g_soloMapLogs = 0;
+		void* g_lastStartData = nullptr;
+		int g_lastOrigSoloIndex = -1;
+		int g_lastSelectedCharaId = -1;
+		int g_lastMvSongId = -1;
+
+		void Log(const std::string& line) {
+			ViewDiag::appendLog("solo-unlock.txt", ViewDiag::timestamp() + " " + line);
+		}
+
+		// writer with a plain function-pointer type, for the RunwayDump helpers
+		void ToSoloLog(const std::string& line) { Log(line); }
+
+		void* KlassOf(void* obj) {
+			if (!obj || !RunwayDump::PlausiblePtr((uintptr_t)obj)) return nullptr;
+			try { return il2cpp_symbols::get_class_from_instance(obj); }
+			catch (...) { return nullptr; }
+		}
+
+		FieldInfo* FieldOf(void* klass, const char* name) {
+			if (!klass || !name) return nullptr;
+			try { return il2cpp_symbols_logged::il2cpp_class_get_field_from_name(klass, name); }
+			catch (...) { return nullptr; }
+		}
+
+		std::string StrOf(void* obj, const char* fieldName) {
+			auto fi = FieldOf(KlassOf(obj), fieldName);
+			if (!fi) return "";
+			try { return ViewDiag::il2cpp_to_utf8(il2cpp_symbols::read_field<Il2CppString*>(obj, fi)); }
+			catch (...) { return ""; }
+		}
+
+		// ---------------------------------------------------------------
+		// one-shot class field dump - reveals the exact master field names of
+		// the vocal-separated feature (IsSongParts, LimitedVocalSeparated*...)
+		// ---------------------------------------------------------------
+		void DumpClassFieldsOnce() {
+			if (g_classDumped) return;
+			g_classDumped = true;
+			Log("=== v24 class field dump (read-only) ===");
+			RunwayDump::DumpClassFields(il2cpp_symbols_logged::get_class("PRISM.Definitions.dll", "PRISM.Definitions", "MstSong"),
+				"MstSong", ToSoloLog);
+			RunwayDump::DumpClassFields(il2cpp_symbols_logged::get_class("PRISM.Definitions.dll", "PRISM.Definitions", "MstSongPartsCharacter"),
+				"MstSongPartsCharacter", ToSoloLog);
+			RunwayDump::DumpClassFields(il2cpp_symbols_logged::get_class("PRISM.Legacy.dll", "PRISM.Live", "MusicData"),
+				"MusicData", ToSoloLog);
+			Log("=== end of class field dump ===");
+		}
+
+		void* TryMasterData() {
+			static auto method_get_Instance = il2cpp_symbols_logged::get_method(
+				"PRISM.Adapters.dll", "PRISM.Adapters", "IAdapterLocator", "get_Instance", 0);
+			if (!method_get_Instance || !method_get_Instance->methodPointer) return nullptr;
+			Il2CppObject* locator = nullptr;
+			try { locator = method_get_Instance->Invoke<Il2CppObject*>(nullptr, {}); }
+			catch (...) { return nullptr; }
+			if (!locator) return nullptr;
+			auto locatorKlass = KlassOf(locator);
+			auto getMasterData = locatorKlass ? il2cpp_class_get_method_from_name(locatorKlass, "get_MasterData", 0) : nullptr;
+			if (!getMasterData || !getMasterData->methodPointer) return nullptr;
+			try { return getMasterData->Invoke<Il2CppObject*>(locator, {}); }
+			catch (...) { return nullptr; }
+		}
+
+		// ---------------------------------------------------------------
+		// [DIAG] v32 - solo index mapping helpers
+		// ---------------------------------------------------------------
+		int FindIndex(const std::vector<int>& list, int value) {
+			for (size_t i = 0; i < list.size(); ++i)
+				if (list[i] == value) return (int)i;
+			return -1;
+		}
+
+		std::string JoinIds(const std::vector<int>& list) {
+			std::string out;
+			for (size_t i = 0; i < list.size() && i < 32; ++i) {
+				if (!out.empty()) out += ",";
+				out += std::to_string(list[i]);
+			}
+			return out;
+		}
+
+		int ReadSongIdFromMvStage(void* mvStage) {
+			if (!mvStage) return -1;
+			auto k = KlassOf(mvStage);
+			auto fi = FieldOf(k, "<Id>k__BackingField");
+			if (!fi) fi = FieldOf(k, "Id");
+			if (!fi) return -1;
+			try { return il2cpp_symbols::read_field<int>(mvStage, fi); }
+			catch (...) { return -1; }
+		}
+
+		std::string ReadMvSceneFromMvStage(void* mvStage) {
+			if (!mvStage) return "";
+			auto fi = FieldOf(KlassOf(mvStage), "<MvScene>k__BackingField");
+			if (!fi) return "";
+			try {
+				return ViewDiag::il2cpp_to_utf8(
+					il2cpp_symbols::read_field<Il2CppString*>(mvStage, fi));
+			}
+			catch (...) { return ""; }
+		}
+
+		// HashSet<int> iteration order without invoking the managed enumerator
+		// (HashSet<T>.Enumerator is a struct, so a generic IEnumerable walk is
+		// unsafe here).  Read _entries and try both plausible Entry<int>
+		// strides; keep the sequence whose values look like character ids.
+		void ReadHashSetIntOrder(void* set, std::vector<int>& out) {
+			out.clear();
+			if (!set || !RunwayDump::PlausiblePtr((uintptr_t)set)) return;
+			auto k = KlassOf(set);
+			auto fe = FieldOf(k, "_entries");
+			auto fc = FieldOf(k, "_count");
+			if (!fe || !fc) return;
+			void* entries = nullptr;
+			int count = -1;
+			try {
+				entries = il2cpp_symbols::read_field<void*>(set, fe);
+				count = il2cpp_symbols::read_field<int>(set, fc);
+			}
+			catch (...) { return; }
+			const char* ecn = entries ? RunwayDump::ClassNameOf(entries) : nullptr;
+			if (!entries || !ecn || strstr(ecn, "[]") == nullptr || count <= 0 || count > 1000)
+				return;
+			int cap = (int)il2cpp_array_length(entries);
+			if (cap <= 0 || cap > 512) return;
+			std::vector<int> a, b;
+			for (int i = 0; i < cap; ++i) {
+				uintptr_t e12 = (uintptr_t)entries + 0x20 + (size_t)i * 12;
+				if (*(int*)e12 >= 0 && (int)a.size() < count) a.push_back(*(int*)(e12 + 8));
+				// only read the 16-byte variant while it still stays inside the
+				// array allocation even if the real Entry<int> stride is 12
+				if (i + 1 < cap) {
+					uintptr_t e16 = (uintptr_t)entries + 0x20 + (size_t)i * 16;
+					if (*(int*)e16 >= 0 && (int)b.size() < count) b.push_back(*(int*)(e16 + 8));
+				}
+			}
+			auto plausible = [](const std::vector<int>& v) {
+				if (v.empty()) return false;
+				for (int x : v)
+					if (x < 0 || x > 1000) return false;
+				return true;
+			};
+			if (plausible(a)) out = a;
+			else if (plausible(b)) out = b;
+			Log(std::format("[v32] voice-ids-raw count={} cap={} s12=[{}] s16=[{}]",
+				count, cap, JoinIds(a), JoinIds(b)));
+		}
+
+		bool DecodePartRow(void* row, int songId, int source) {
+			if (!row) return false;
+			auto fList = FieldOf(KlassOf(row), "<MstCharacterIdList>k__BackingField");
+			if (!fList) {
+				Log(std::format("[v34] part-row song={} source={} list-field-missing", songId, source));
+				return false;
+			}
+			void* list = nullptr;
+			try { list = il2cpp_symbols::read_field<void*>(row, fList); }
+			catch (...) { list = nullptr; }
+			if (!list) {
+				Log(std::format("[v34] part-row song={} source={} list=null", songId, source));
+				return false;
+			}
+			auto fSize = FieldOf(KlassOf(list), "_size");
+			auto fItems = FieldOf(KlassOf(list), "_items");
+			int size = -1;
+			void* items = nullptr;
+			if (fSize) try { size = il2cpp_symbols::read_field<int>(list, fSize); } catch (...) { size = -1; }
+			if (fItems) try { items = il2cpp_symbols::read_field<void*>(list, fItems); } catch (...) { items = nullptr; }
+			const char* icn = items ? RunwayDump::ClassNameOf(items) : nullptr;
+			if (size < 0 || size > 64 || !items || !icn || !strstr(icn, "[]")) {
+				Log(std::format("[v34] part-row song={} source={} bad-list size={} items={}",
+					songId, source, size, RunwayDump::PtrStr(items)));
+				return false;
+			}
+			g_songPartsIds.clear();
+			for (int j = 0; j < size; ++j)
+				g_songPartsIds.push_back(*(int*)((uintptr_t)items + 0x20 + (size_t)j * 4));
+			g_songPartsSongId = songId;
+			Log(std::format("[v34] part-row song={} source={} size={} ids=[{}]",
+				songId, source, size, JoinIds(g_songPartsIds)));
+			return true;
+		}
+
+		void* LookupPartRow(void* table, int songId) {
+			auto k = KlassOf(table);
+			if (!k) return nullptr;
+			const char* names[] = { "get_Item", "Get", "GetValue" };
+			for (const char* name : names) {
+				auto mi = il2cpp_class_get_method_from_name(k, name, 1);
+				if (!mi || !mi->methodPointer) continue;
+				try {
+					auto row = mi->Invoke<Il2CppObject*>((Il2CppObject*)table, { (Il2CppObject*)&songId });
+					Log(std::format("[v34] part-lookup {} song={} -> {}", name, songId, RunwayDump::PtrStr(row)));
+					if (row) return row;
+				}
+				catch (...) {
+					Log(std::format("[v34] part-lookup {} song={} threw", name, songId));
+				}
+			}
+			if (!g_partMethodsDumped) {
+				g_partMethodsDumped = true;
+				void* iter = nullptr;
+				int n = 0;
+				while (auto m = il2cpp_class_get_methods(k, &iter)) {
+					if (n++ > 80) break;
+					Log(std::format("[v34] table-method {} argc={}",
+						m->name ? m->name : "?", (int)m->parameters_count));
+				}
+			}
+			return nullptr;
+		}
+
+		// One line per newly seen song: the MstSongPartsCharacter row and the
+		// ordered MstCharacterIdList (the part order used by the song data).
+		void DumpSongPartsForSong(int songId) {
+			if (songId <= 0 || songId == g_songPartsSongId) return;
+			static int triedSong = -1;
+			static int tries = 0;
+			if (songId != triedSong) { triedSong = songId; tries = 0; }
+			if (tries++ >= 3) return;
+			g_songPartsIds.clear();
+			auto masterData = TryMasterData();
+			if (!masterData) {
+				Log(std::format("[v32] part-list song={} master=null", songId));
+				return;
+			}
+			auto fi = FieldOf(KlassOf(masterData), "SongPartsCharacters");
+			if (!fi) {
+				Log(std::format("[v32] part-list song={} field-missing", songId));
+				return;
+			}
+			void* table = nullptr;
+			try { table = il2cpp_symbols::read_field<void*>(masterData, fi); }
+			catch (...) { table = nullptr; }
+			void* arr = nullptr;
+			if (table) {
+				auto fd = FieldOf(KlassOf(table), "data");
+				if (fd) try { arr = il2cpp_symbols::read_field<void*>(table, fd); } catch (...) { arr = nullptr; }
+			}
+			const char* acn = arr ? RunwayDump::ClassNameOf(arr) : nullptr;
+			const int len = (arr && acn && strstr(acn, "[]")) ? (int)il2cpp_array_length(arr) : -1;
+			Log(std::format("[v32] part-list song={} table={} arr={} len={}",
+				songId, RunwayDump::PtrStr(table), RunwayDump::PtrStr(arr), len));
+			if (len <= 0 || len > 512) return;
+			for (int i = 0; i < len; ++i) {
+				void* row = nullptr;
+				try { row = il2cpp_symbols::array_get_value(arr, i); }
+				catch (...) { row = nullptr; }
+				if (!row) continue;
+				auto fId = FieldOf(KlassOf(row), "<MstSongId>k__BackingField");
+				if (!fId) continue;
+				int rowSong = -1;
+				try { rowSong = il2cpp_symbols::read_field<int>(row, fId); }
+				catch (...) { continue; }
+				if (rowSong != songId) continue;
+				if (DecodePartRow(row, songId, i)) return;
+				return;
+			}
+			void* looked = LookupPartRow(table, songId);
+			if (looked && DecodePartRow(looked, songId, -1)) return;
+			Log(std::format("[v32] part-list song={} row-not-loaded", songId));
+		}
+
+		std::string ReadSoloMapMode() {
+			char buf[64]{};
+			FILE* f = fopen("solo-map.txt", "r");
+			if (f) {
+				if (!fgets(buf, sizeof(buf), f)) buf[0] = '\0';
+				fclose(f);
+			}
+			std::string s = buf;
+			auto trim = [](std::string& v) {
+				while (!v.empty() && (v.back() == '\r' || v.back() == '\n' || v.back() == ' ' || v.back() == '\t'))
+					v.pop_back();
+				size_t p = v.find_first_not_of(" \t");
+				if (p == std::string::npos) v.clear();
+				else v = v.substr(p);
+			};
+			trim(s);
+			auto eq = s.find('=');
+			if (eq != std::string::npos) { s = s.substr(eq + 1); trim(s); }
+			const char* env = getenv("SCSP_SOLO_MAP");
+			if (env && *env) s = env;
+			if (s.empty()) s = "post";
+			return s;
+		}
+
+		void ApplySoloIndexMap(void* _this, void* onStageIdols, int origIndex, int charaId, int songId) {
+			if (g_soloMapLogs++ > 60) return;
+			const std::string mode = ReadSoloMapMode();
+			auto k = KlassOf(_this);
+			if (!k) return;
+			auto fiArr = FieldOf(k, "<OnStageIdols>k__BackingField");
+			if (!fiArr) fiArr = FieldOf(k, "OnStageIdols");
+			void* postArr = nullptr;
+			if (fiArr) try { postArr = il2cpp_symbols::read_field<void*>(_this, fiArr); } catch (...) { postArr = nullptr; }
+			if (!postArr) postArr = onStageIdols;
+			int postIdx = -1;
+			std::vector<int> postIds;
+			if (postArr) {
+				int len = (int)il2cpp_array_length(postArr);
+				for (int i = 0; i < len && i < 32; ++i) {
+					auto idol = (managed::UnitIdol*)il2cpp_symbols::array_get_value(postArr, i);
+					int id = idol ? UnitIdol::GetCharaId(idol) : -1;
+					postIds.push_back(id);
+					if (id == charaId && postIdx < 0) postIdx = i;
+				}
+			}
+			const int partIdx = (g_songPartsSongId == songId) ? FindIndex(g_songPartsIds, charaId) : -1;
+			const int hashIdx = FindIndex(g_soloVoiceIds, charaId);
+			int newIndex = origIndex;
+			if (mode == "post" && postIdx >= 0) newIndex = postIdx;
+			else if (mode == "part" && partIdx >= 0) newIndex = partIdx;
+			else if (mode == "hash" && hashIdx >= 0) newIndex = hashIdx;
+			else if (mode == "prev") newIndex = origIndex > 0 ? origIndex - 1 : 0;
+			else if (mode == "next" && origIndex + 1 < (int)postIds.size()) newIndex = origIndex + 1;
+			auto fiIdx = FieldOf(k, "<VocalSeparatedSoloIndex>k__BackingField");
+			if (!fiIdx) fiIdx = FieldOf(k, "VocalSeparatedSoloIndex");
+			int fieldBefore = -999, fieldAfter = -999;
+			if (fiIdx) try { fieldBefore = il2cpp_symbols::read_field<int>(_this, fiIdx); } catch (...) { fieldBefore = -999; }
+			if (fiIdx && newIndex != origIndex && newIndex >= 0 &&
+				(postIds.empty() || newIndex < (int)postIds.size())) {
+				int value = newIndex;
+				il2cpp_field_set_value(_this, fiIdx, &value);
+			}
+			if (fiIdx) try { fieldAfter = il2cpp_symbols::read_field<int>(_this, fiIdx); } catch (...) { fieldAfter = -999; }
+			Log(std::format("[v32] solo-map mode={} song={} chara={} orig={} post={} part={} hash={} new={} field={}->{} post=[{}] hashIds=[{}]",
+				mode, songId, charaId, origIndex, postIdx, partIdx, hashIdx, newIndex,
+				fieldBefore, fieldAfter, JoinIds(postIds), JoinIds(g_soloVoiceIds)));
+		}
+
+		void RememberStartData(void* data, int origIndex, int charaId, int songId) {
+			g_lastStartData = data;
+			g_lastOrigSoloIndex = origIndex;
+			g_lastSelectedCharaId = charaId;
+			g_lastMvSongId = songId;
+		}
+
+		// [v32] second chance: by PreLoadAsync the SongParts row and the
+		// post-sort lineup should both be available.  Recompute from the
+		// original (pre-map) index captured in the ctor.
+		void RemapAtPreLoad(void* data, void* onStageIdols) {
+			if (!data || data != g_lastStartData) return;
+			DumpSongPartsForSong(g_lastMvSongId);
+			int idx = g_lastOrigSoloIndex;
+			int chara = g_lastSelectedCharaId;
+			if (chara < 0 && onStageIdols && idx >= 0) {
+				int len = (int)il2cpp_array_length(onStageIdols);
+				if (idx < len) {
+					auto idol = (managed::UnitIdol*)il2cpp_symbols::array_get_value(onStageIdols, idx);
+					if (idol) chara = UnitIdol::GetCharaId(idol);
+				}
+			}
+			ApplySoloIndexMap(data, onStageIdols, idx, chara, g_lastMvSongId);
+		}
+
+		// ---------------------------------------------------------------
+		// one-shot: every row of MasterData.SongPartsCharacters - the master
+		// table that maps a song to the characters taking part in 分唱.
+		// Rows are written through the v21 read-only table walker.
+		// ---------------------------------------------------------------
+		void DumpPartsCharactersOnce() {
+			if (g_tablesDumped) return;
+			auto masterData = TryMasterData();
+			if (!masterData) return;
+			g_tablesDumped = true;
+			auto fi = FieldOf(KlassOf(masterData), "SongPartsCharacters");
+			if (!fi) { Log("[v24] MasterData.SongPartsCharacters field not found"); return; }
+			void* table = nullptr;
+			try { table = il2cpp_symbols::read_field<void*>(masterData, fi); }
+			catch (...) { table = nullptr; }
+			Log("[v24] dumping MasterData.SongPartsCharacters rows into runway-master-dump.txt");
+			try { RunwayDump::DumpTableRows(table, "MstSongPartsCharacter(v24)", 1000); }
+			catch (...) { Log("[v24] SongPartsCharacters dump threw"); }
+		}
+
+		// ---------------------------------------------------------------
+		// dump the full field set of the MstSong row that was asked about
+		// ---------------------------------------------------------------
+		bool ReadBoolF(void* obj, const char* fieldName) {
+			auto fi = FieldOf(KlassOf(obj), fieldName);
+			if (!fi) return false;
+			try { return il2cpp_symbols::read_field<bool>(obj, fi); }
+			catch (...) { return false; }
+		}
+
+		int ReadIntF(void* obj, const char* fieldName, int def = -1) {
+			auto fi = FieldOf(KlassOf(obj), fieldName);
+			if (!fi) return def;
+			try { return il2cpp_symbols::read_field<int>(obj, fi); }
+			catch (...) { return def; }
+		}
+
+		void DumpSongRow(void* musicData, int callNo) {
+			if (g_songDumps >= 10) return;
+			auto fi = FieldOf(KlassOf(musicData), "<Master>k__BackingField");
+			if (!fi) {
+				if (callNo == 1) Log("  (MusicData.<Master>k__BackingField not found)");
+				return;
+			}
+			void* row = nullptr;
+			try { row = il2cpp_symbols::read_field<void*>(musicData, fi); }
+			catch (...) { return; }
+			if (!row || !RunwayDump::PlausiblePtr((uintptr_t)row)) return;
+			++g_songDumps;
+			g_lastSongId = ReadIntF(row, "<Id>k__BackingField");
+			std::string name = StrOf(row, "<Name>k__BackingField");
+			if (name.empty()) name = StrOf(row, "<SongName>k__BackingField");
+			if (name.empty()) name = StrOf(row, "<Title>k__BackingField");
+			if (name.empty()) name = "(name field unknown)";
+			Log(std::format("  song row #{} id={} name=\"{}\" isSongParts={} isSongPartsSolo={}",
+				g_songDumps, g_lastSongId, name,
+				ReadBoolF(row, "<IsSongParts>k__BackingField") ? 1 : 0,
+				ReadBoolF(row, "<IsSongPartsSolo>k__BackingField") ? 1 : 0));
+			auto unlockListField = FieldOf(KlassOf(row), "<LimitedSongPartsUnlockProductList>k__BackingField");
+			if (unlockListField) {
+				void* lst = nullptr;
+				try { lst = il2cpp_symbols::read_field<void*>(row, unlockListField); }
+				catch (...) { lst = nullptr; }
+				const char* cn = (lst && RunwayDump::PlausiblePtr((uintptr_t)lst)) ? RunwayDump::ClassNameOf(lst) : nullptr;
+				int cnt = -1;
+				if (lst && RunwayDump::PlausiblePtr((uintptr_t)lst)) {
+					auto lstKlass = il2cpp_symbols::get_class_from_instance(lst);
+					auto sizeField = lstKlass ? il2cpp_class_get_field_from_name(lstKlass, "_size") : nullptr;
+					if (sizeField) { try { cnt = il2cpp_symbols::read_field<int>(lst, sizeField); } catch (...) { cnt = -1; } }
+				}
+				Log(std::format("  LimitedSongPartsUnlockProductList = {} ({}) size={}",
+					lst ? RunwayDump::PtrStr(lst) : "(null)", cn ? cn : "?", cnt));
+			}
+			else {
+				Log("  (no <LimitedSongPartsUnlockProductList> field on this row)");
+			}
+			Log("  (full field dump follows in runway-master-dump.txt)");
+			try { RunwayDump::ReflectDump(row, 1, "MstSong(v24)", false); }
+			catch (...) { Log("  (ReflectDump threw)"); }
+		}
+
+		// ---------------------------------------------------------------
+		// detours - constant returns, arguments are never touched.
+		//
+		// Name forms verified against global-metadata.dat:
+		//   MusicData.get_IsLimitedVocalSeparatedLocked  (property, 0 args)
+		//   MusicData.IsLimitedVocalSeparatedLocked      (1 arg, if present)
+		//   MusicData.CheckLimitedVocalSeparatedSatisfy  (1 arg)
+		//   MstSong.CheckLimitedVocalSeparatedSatisfy    (0 args, if present)
+		//   MusicData.get_IsAllCharacterVocalSeparated   (property, 0 args)
+		// None of them calls the original, so the ABI cannot be disturbed
+		// even if an argument is typed differently than expected.
+		// ---------------------------------------------------------------
+		// [v26] field writer (defined below) - declared here for the detours
+		bool PatchSongRow(void* row, const char* why);
+		// [v28] song-status writer + solo-voice ownership probe
+		void PatchSongStatus(void* musicData, const char* why);
+		void LogOwnedSoloVoices(void* musicData, const char* why);
+
+		HOOK_ORIG_TYPE SoloLocked_get_orig;
+		bool SoloLocked_get_hook(void* _this, void* mtd) {
+			// [v26] the MusicData being asked about == the song being looked
+			// at, so write its master flag before the UI reads it again
+			auto masterFi = FieldOf(KlassOf(_this), "<Master>k__BackingField");
+			if (masterFi) {
+				void* row = nullptr;
+				try { row = il2cpp_symbols::read_field<void*>(_this, masterFi); }
+				catch (...) { row = nullptr; }
+				PatchSongRow(row, "get_IsLimitedVocalSeparatedLocked");
+			}
+			// [v28] pretend the "limited song parts" product was bought and
+			// record which solo voices the client thinks we own
+			PatchSongStatus(_this, "get_IsLimitedVocalSeparatedLocked");
+			LogOwnedSoloVoices(_this, "get_IsLimitedVocalSeparatedLocked");
+			const int n = ++g_lockedCalls;
+			if (n <= 40) {
+				Log(std::format("[v24] MusicData.get_IsLimitedVocalSeparatedLocked -> false (#{})", n));
+				DumpSongRow(_this, n);
+			}
+			return false;
+		}
+
+		// [v26] trigger + passthrough: if the panel asks MusicData for the
+		// valid vocal-separated modes, patch the master row first and then
+		// let the original compute the answer from the patched field.
+		HOOK_ORIG_TYPE MusicData_GetValidVocalSeparatedMode_orig;
+		void* MusicData_GetValidVocalSeparatedMode_hook(void* _this, void* mtd) {
+			auto masterFi = FieldOf(KlassOf(_this), "<Master>k__BackingField");
+			if (masterFi) {
+				void* row = nullptr;
+				try { row = il2cpp_symbols::read_field<void*>(_this, masterFi); }
+				catch (...) { row = nullptr; }
+				PatchSongRow(row, "GetValidVocalSeparatedMode");
+			}
+			PatchSongStatus(_this, "GetValidVocalSeparatedMode");
+			LogOwnedSoloVoices(_this, "GetValidVocalSeparatedMode");
+			// pointer-sized return covers enum (eax), pointer and object alike
+			void* ret = HOOK_CAST_CALL(void*, MusicData_GetValidVocalSeparatedMode)(_this, mtd);
+			if (++g_validModeCalls <= 40) {
+				std::string extra;
+				if (ret && RunwayDump::PlausiblePtr((uintptr_t)ret)) {
+					const char* cn = RunwayDump::ClassNameOf(ret);
+					if (cn) extra = std::string(" class=") + cn;
+				}
+				Log(std::format("[v26] MusicData.GetValidVocalSeparatedMode -> {} (as int {}){}",
+					ViewDiag::ptr_str(ret), (int)(intptr_t)ret, extra));
+			}
+			return ret;
+		}
+
+		HOOK_ORIG_TYPE SoloLocked_arg_orig;
+		bool SoloLocked_arg_hook(void* _this, void* arg, void* mtd) {
+			const int n = ++g_lockedArgCalls;
+			if (n <= 40)
+				Log(std::format("[v24] MusicData.IsLimitedVocalSeparatedLocked(arg={}) -> false (#{})",
+					ViewDiag::ptr_str(arg), n));
+			return false;
+		}
+
+		HOOK_ORIG_TYPE SoloSatisfy_music_orig;
+		bool SoloSatisfy_music_hook(void* _this, void* arg, void* mtd) {
+			if (++g_satisfyCalls <= 40)
+				Log(std::format("[v24] MusicData.CheckLimitedVocalSeparatedSatisfy(arg={}) -> true (#{})",
+					ViewDiag::ptr_str(arg), g_satisfyCalls));
+			return true;
+		}
+
+		HOOK_ORIG_TYPE SoloSatisfy_mst_orig;
+		bool SoloSatisfy_mst_hook(void* _this, void* mtd) {
+			if (++g_satisfyMstCalls <= 40)
+				Log(std::format("[v24] MstSong.CheckLimitedVocalSeparatedSatisfy -> true (#{})", g_satisfyMstCalls));
+			return true;
+		}
+
+		HOOK_ORIG_TYPE SoloAllCharas_orig;
+		bool SoloAllCharas_hook(void* _this, void* mtd) {
+			if (++g_allCalls <= 40)
+				Log(std::format("[v24] MusicData.get_IsAllCharacterVocalSeparated -> true (#{})", g_allCalls));
+			return true;
+		}
+
+		// ---------------------------------------------------------------
+		// [v25] the real gate for songs like "Dye the sky." (#37, 037_DyeSky):
+		//   MstSong #37  IsSongParts = true,  IsSongPartsSolo = false
+		// so the 歌唱設定 panel greys out ソロ with
+		//   "この楽曲では対応していません�?
+		// The master row is immutable, so only the *getter* is overridden:
+		// songs that already report IsSongParts=true are told solo is
+		// supported; songs without the part feature keep their value.
+		// ---------------------------------------------------------------
+		HOOK_ORIG_TYPE MstSong_get_IsSongPartsSolo_orig;
+		bool MstSong_get_IsSongPartsSolo_hook(void* _this, void* mtd) {
+			const bool parts = ReadBoolF(_this, "<IsSongParts>k__BackingField");
+			const int n = ++g_soloFlagCalls;
+			if (n <= 40)
+				Log(std::format("[v25] MstSong#{} get_IsSongPartsSolo: isSongParts={} -> {}",
+					ReadIntF(_this, "<Id>k__BackingField"), parts ? 1 : 0, parts ? "true" : "false(native)"));
+			if (!parts) return false;
+			return true;
+		}
+
+		// ---------------------------------------------------------------
+		// [v26] one byte, one row: write <IsSongPartsSolo> = true on master
+		// rows that already report <IsSongParts> = true.  The v25 run proved
+		// the UI never calls the property getter (zero call lines), so the
+		// flag has to be written where every reader looks: the field itself.
+		// Same technique as the v14/v15 Shiny Runway EndDate patch.
+		// ---------------------------------------------------------------
+		int g_rowsPatched = 0;
+		int g_patchLogs = 0;
+
+		bool PatchSongRow(void* row, const char* why) {
+			if (!row || !RunwayDump::PlausiblePtr((uintptr_t)row)) return false;
+			auto klass = KlassOf(row);
+			auto fiSolo = FieldOf(klass, "<IsSongPartsSolo>k__BackingField");
+			auto fiParts = FieldOf(klass, "<IsSongParts>k__BackingField");
+			if (!fiSolo || !fiParts) return false;                     // not an MstSong row
+			if (fiSolo->offset < 0x10 || fiSolo->offset > 0x8000) return false;
+			if (fiParts->offset < 0x10 || fiParts->offset > 0x8000) return false;
+			const bool solo = ReadBoolF(row, "<IsSongPartsSolo>k__BackingField");
+			const bool parts = ReadBoolF(row, "<IsSongParts>k__BackingField");
+			const bool wantParts = g_allSongs ? true : parts;
+			if (!wantParts && !solo) return false;
+			int wrote = 0;
+			if (wantParts && !parts) {
+				*(reinterpret_cast<uint8_t*>((uintptr_t)row + (size_t)fiParts->offset)) = 1;
+				++wrote;
+			}
+			if (!solo) {
+				*(reinterpret_cast<uint8_t*>((uintptr_t)row + (size_t)fiSolo->offset)) = 1;
+				++wrote;
+			}
+			if (!wrote) return false;
+			++g_rowsPatched;
+			if (g_patchLogs++ < 60)
+				Log(std::format("[v27] patched MstSong#{} parts {}->1 solo {}->1 ({}) total={}",
+					ReadIntF(row, "<Id>k__BackingField"), parts ? 1 : 0, solo ? 1 : 0, why, g_rowsPatched));
+			return true;
+		}
+
+		// ---------------------------------------------------------------
+		// [v28] a character's solo voice is a separate PRODUCT
+		//   LimitedVoiceSeparate_{charId}.usm
+		// bought through LimitedVoiceSeparatePurchaseOverlayViewModel
+		// (fields Price / CharacterIds / SongName / MusicId).  The client
+		// trusts ISongStatus.IsLimitedSongPartsUnlocked for "already owned";
+		// force that one byte so the audio + lip-sync path (the one that knows
+		// who sings) is taken instead of the "not acquired" path, which is
+		// exactly what produced "nobody opens their mouth / wrong singer".
+		// ---------------------------------------------------------------
+		void PatchSongStatus(void* musicData, const char* why) {
+			auto songFi = FieldOf(KlassOf(musicData), "<Song>k__BackingField");
+			if (!songFi) return;
+			void* st = nullptr;
+			try { st = il2cpp_symbols::read_field<void*>(musicData, songFi); }
+			catch (...) { st = nullptr; }
+			if (!st || !RunwayDump::PlausiblePtr((uintptr_t)st)) return;
+			auto klass = KlassOf(st);
+			if (!klass) return;
+			for (const char* nm : { "<IsLimitedSongPartsUnlocked>k__BackingField",
+				"<isLimitedSongPartsUnlocked>k__BackingField",
+				"isLimitedSongPartsUnlocked" }) {
+				auto fi = FieldOf(klass, nm);
+				if (!fi || fi->offset < 0x10 || fi->offset > 0x8000) continue;
+				bool cur = false;
+				try { cur = il2cpp_symbols::read_field<bool>(st, fi); }
+				catch (...) { continue; }
+				if (cur) return;                                     // already unlocked
+				*(reinterpret_cast<uint8_t*>((uintptr_t)st + (size_t)fi->offset)) = 1;
+				Log(std::format("[v28] patched SongStatus {} = true ({})", nm, why));
+				return;
+			}
+		}
+
+		// read-only probe: which solo voices does the client think we own?
+		void LogOwnedSoloVoices(void* musicData, const char* why) {
+			auto fi = FieldOf(KlassOf(musicData), "limitedVocalSeparatedCharacterIds");
+			if (!fi) {
+				Log(std::format("[v28] no limitedVocalSeparatedCharacterIds field ({})", why));
+				return;
+			}
+			void* set = nullptr;
+			try { set = il2cpp_symbols::read_field<void*>(musicData, fi); }
+			catch (...) { set = nullptr; }
+			if (!set || !RunwayDump::PlausiblePtr((uintptr_t)set)) {
+				Log(std::format("[v28] limitedVocalSeparatedCharacterIds = null ({})", why));
+				return;
+			}
+			int cnt = -1;
+			auto cntFi = FieldOf(KlassOf(set), "_count");
+			if (cntFi) {
+				try { cnt = il2cpp_symbols::read_field<int>(set, cntFi); }
+				catch (...) { cnt = -1; }
+			}
+			// [v32] capture the HashSet iteration order once per MusicData
+			// instance.  HashSet<T>.Enumerator is a struct, so the generic
+			// IEnumerable helper is not safe; ReadHashSetIntOrder walks the
+			// _entries array instead.
+			if (set != g_soloVoiceSet) {
+				g_soloVoiceSet = set;
+				ReadHashSetIntOrder(set, g_soloVoiceIds);
+				Log(std::format("[v32] voice-ids stored count={} ids=[{}] ({})",
+					cnt, JoinIds(g_soloVoiceIds), why));
+			}
+			const std::string ids = g_soloVoiceIds.empty() ? "(raw-empty)" : JoinIds(g_soloVoiceIds);
+			const char* cn = RunwayDump::ClassNameOf(set);
+			Log(std::format("[v32] limitedVocalSeparatedCharacterIds count={} class={} ids=[{}] ({})",
+				cnt, cn ? cn : "?", ids, why));
+		}
+
+		// walk MasterData.Songs once and patch every part-capable song
+		void PatchAllSongs() {
+			auto masterData = TryMasterData();
+			if (!masterData) return;
+			auto fi = FieldOf(KlassOf(masterData), "Songs");
+			if (!fi) { Log("[v26] MasterData.Songs not found"); return; }
+			void* table = nullptr;
+			try { table = il2cpp_symbols::read_field<void*>(masterData, fi); }
+			catch (...) { table = nullptr; }
+			if (!table) { Log("[v26] MasterData.Songs = null"); return; }
+			void* arr = RunwayDump::ReadPtr(table, "data");
+			int n = RunwayDump::ArrayLength(arr);
+			if (n <= 0) {
+				auto items = RunwayDump::ReadPtr(arr, "_items");
+				int size = RunwayDump::ReadInt(arr, "_size");
+				if (items && size > 0) { arr = items; n = size; }
+			}
+			if (n <= 0) return;
+			g_songsPatched = true;
+			Log(std::format("[v26] MasterData.Songs rows = {}", n));
+			int parts = 0, solo = 0;
+			for (int i = 0; i < n && i < 2000; ++i) {
+				void* row = (void*)(*(uintptr_t*)RunwayDump::ArrayElem(arr, i, 8));
+				if (!row) continue;
+				if (ReadBoolF(row, "<IsSongParts>k__BackingField")) ++parts;
+				if (ReadBoolF(row, "<IsSongPartsSolo>k__BackingField")) ++solo;
+				PatchSongRow(row, "Songs table");
+			}
+			Log(std::format("[v27] songs: total={} parts(native)={} solo(native)={} patched={} allSongs={}",
+				n, parts, solo, g_rowsPatched, g_allSongs ? 1 : 0));
+		}
+
+
+		void* MethodAddr(const char* assembly, const char* ns, const char* klass, const char* name, int argc) {
+			auto k = il2cpp_symbols_logged::get_class(assembly, ns, klass);
+			if (!k) { Log(std::format("[v24] class {}.{} not found in {}", ns, klass, assembly)); return nullptr; }
+			auto mi = il2cpp_class_get_method_from_name(k, name, argc);
+			if (!mi || !mi->methodPointer) {
+				Log(std::format("[v24] {}.{}::{}({}) not found", ns, klass, name, argc));
+				return nullptr;
+			}
+			std::string params;
+			const uint32_t pc = il2cpp_method_get_param_count(mi);
+			for (uint32_t i = 0; i < pc && i < 8; ++i) {
+				if (i) params += ", ";
+				const char* tn = il2cpp_symbols::il2cpp_method_get_param_type_name(mi, i);
+				params += tn ? tn : "?";
+			}
+			auto rt = il2cpp_method_get_return_type(mi);
+			const char* rtn = rt ? il2cpp_type_get_name(rt) : "?";
+			Log(std::format("[v24] {}.{}::{}({}) : {} @ {}", ns, klass, name, params,
+				rtn ? rtn : "?", ViewDiag::ptr_str((void*)mi->methodPointer)));
+			return (void*)mi->methodPointer;
+		}
+
+		bool HookAt(const char* label, void* target, void* detour, HOOK_ORIG_TYPE& orig) {
+			if (!target) return false;
+#ifdef __SAFETYHOOK
+			AddSafetyHook(label, target, detour, orig);
+#else
+			MH_CreateHook(target, detour, &orig);
+			MH_EnableHook(target);
+#endif
+			return true;
+		}
+
+
+		// ---------------------------------------------------------------
+		// [v33] minimal, file-gated lip fallback.
+		//
+		//   `lip.txt` (game root):
+		//     diag   - install the detour, log only (no table dereference)
+		//     on     - also cache the last non-solo lip table for the current
+		//              song and reuse it when solo setup receives null
+		//     off / missing - do not install at all
+		//
+		//   The v30 crash likely came from the reflection dumps on an
+		//   unverified table pointer.  This version never calls ClassOf /
+		//   ReflectDump / DumpClassFields from the detour.
+		// ---------------------------------------------------------------
+		std::string ReadLipMode() {
+			char buf[32]{};
+			FILE* f = fopen("lip.txt", "r");
+			if (f) {
+				if (!fgets(buf, sizeof(buf), f)) buf[0] = '\0';
+				fclose(f);
+			}
+			std::string s = buf;
+			while (!s.empty() && (s.back() == '\r' || s.back() == '\n' || s.back() == ' ' || s.back() == '\t'))
+				s.pop_back();
+			size_t p = s.find_first_not_of(" \t");
+			if (p == std::string::npos) s.clear(); else s = s.substr(p);
+			return s;
+		}
+
+		void* g_lipCachedHandle = nullptr;
+		int g_lipCachedSong = -1;
+		int g_lipHookCalls = 0;
+		int g_lipHookSubs = 0;
+		int g_lipFlagLogs = 0;
+		bool g_lipForceMode = false;
+		std::mutex g_lipMutex;
+
+		bool LipReadBool(void* obj, const char* name) {
+			if (!obj) return false;
+			auto fi = FieldOf(KlassOf(obj), name);
+			if (!fi) return false;
+			try { return il2cpp_symbols::read_field<bool>(obj, fi); }
+			catch (...) { return false; }
+		}
+
+		int LipCharaId(void* ch) {
+			if (!ch) return -1;
+			auto fi = FieldOf(KlassOf(ch), "<CharacterID>k__BackingField");
+			if (!fi) return -1;
+			try { return il2cpp_symbols::read_field<int>(ch, fi); }
+			catch (...) { return -1; }
+		}
+
+		void* LipControllerOf(void* ch) {
+			if (!ch) return nullptr;
+			auto fi = FieldOf(KlassOf(ch), "_lipSyncController");
+			if (!fi) return nullptr;
+			try { return il2cpp_symbols::read_field<void*>(ch, fi); }
+			catch (...) { return nullptr; }
+		}
+
+		void* LipTableOf(void* controller) {
+			if (!controller) return nullptr;
+			auto fi = FieldOf(KlassOf(controller), "_lipSyncTable");
+			if (!fi) return nullptr;
+			try { return il2cpp_symbols::read_field<void*>(controller, fi); }
+			catch (...) { return nullptr; }
+		}
+
+		HOOK_ORIG_TYPE Character_SetupLip_orig;
+		void Character_SetupLip_hook(void* _this, void* lipTable, float arg1, float arg2, void* mtd) {
+			const std::string lipMode = ReadLipMode();
+			void* useTable = lipTable;
+			bool reused = false;
+			if (lipMode == "on" || lipMode == "force") {
+				std::lock_guard<std::mutex> lock(g_lipMutex);
+				const bool valid = lipTable && RunwayDump::PlausiblePtr((uintptr_t)lipTable);
+				// Prefer a table captured outside solo mode; only fall back to
+				// caching a solo table when this song has no cached table yet.
+				// Never overwrite a good normal-mode table with a solo one.
+				const bool haveForSong = g_lipCachedHandle && g_lipCachedSong == g_lastSongId;
+				if (valid && (g_lastSoloVocalMode != 2 || !haveForSong)) {
+					if (g_lipCachedHandle) il2cpp_gchandle_free(g_lipCachedHandle);
+					g_lipCachedHandle = il2cpp_gchandle_new((Il2CppObject*)lipTable, false);
+					g_lipCachedSong = g_lastSongId;
+				}
+				else if (!lipTable && g_lipCachedHandle && g_lastSongId > 0 &&
+					g_lipCachedSong == g_lastSongId) {
+					void* cached = il2cpp_gchandle_get_target(g_lipCachedHandle);
+					if (cached && RunwayDump::PlausiblePtr((uintptr_t)cached)) {
+						useTable = cached;
+						reused = true;
+						++g_lipHookSubs;
+					}
+				}
+			}
+			const int call = ++g_lipHookCalls;
+			if (call <= 200) {
+				Log(std::format("[v33] SetupLip song={} vmMode={} lip={} this={} in={} use={} inputNull={} reused={} a1={} a2={}",
+					g_lastSongId, g_lastSoloVocalMode, lipMode, ViewDiag::ptr_str(_this),
+					ViewDiag::ptr_str((void*)lipTable), ViewDiag::ptr_str(useTable),
+					lipTable ? 0 : 1, reused ? 1 : 0, arg1, arg2));
+			}
+			return HOOK_CAST_CALL(void, Character_SetupLip)(_this, useTable, arg1, arg2, mtd);
+		}
+
+		HOOK_ORIG_TYPE Character_UpdateLip_orig;
+		HOOK_ORIG_TYPE LipSyncController_UpdateLip_orig;
+		int g_lipUpdateCalls = 0;
+
+		void LipPatchController(void* controller, const char* source) {
+			if (!controller) return;
+			auto k = KlassOf(controller);
+			if (!k) return;
+			auto fi = FieldOf(k, "_lipSyncTable");
+			if (!fi) return;
+			void* table = nullptr;
+			try { table = il2cpp_symbols::read_field<void*>(controller, fi); }
+			catch (...) { table = nullptr; }
+
+			const int call = ++g_lipUpdateCalls;
+			static std::string cachedMode;
+			static int modeReadAt = -1000;
+			if (call - modeReadAt >= 30) {
+				modeReadAt = call;
+				cachedMode = ReadLipMode();
+			}
+			const std::string& mode = cachedMode;
+			bool patched = false;
+			if (mode == "on" || mode == "force") {
+				std::lock_guard<std::mutex> lock(g_lipMutex);
+				const bool valid = table && RunwayDump::PlausiblePtr((uintptr_t)table);
+				const bool haveForSong = g_lipCachedHandle && g_lipCachedSong == g_lastSongId;
+				if (valid && (g_lastSoloVocalMode != 2 || !haveForSong)) {
+					if (g_lipCachedHandle) il2cpp_gchandle_free(g_lipCachedHandle);
+					g_lipCachedHandle = il2cpp_gchandle_new((Il2CppObject*)table, false);
+					g_lipCachedSong = g_lastSongId;
+				}
+				else if (!table && g_lipCachedHandle && g_lastSongId > 0 &&
+					g_lipCachedSong == g_lastSongId) {
+					void* cached = il2cpp_gchandle_get_target(g_lipCachedHandle);
+					if (cached && RunwayDump::PlausiblePtr((uintptr_t)cached)) {
+						void* value = cached;
+						il2cpp_field_set_value(controller, fi, &value);
+						patched = true;
+					}
+				}
+			}
+			if (call <= 40 || patched) {
+				Log(std::format("[v34] LipUpdate src={} song={} vmMode={} lip={} this={} table={} patched={}",
+					source, g_lastSongId, g_lastSoloVocalMode, mode,
+					ViewDiag::ptr_str(controller), ViewDiag::ptr_str(table), patched ? 1 : 0));
+			}
+		}
+
+		void Character_UpdateLip_hook(void* _this, float dt, void* mtd) {
+			try {
+				if (_this) {
+					auto fi = FieldOf(KlassOf(_this), "_lipSyncController");
+					if (fi) {
+						void* controller = nullptr;
+						try { controller = il2cpp_symbols::read_field<void*>(_this, fi); }
+						catch (...) { controller = nullptr; }
+						LipPatchController(controller, "Character.UpdateLip");
+					}
+				}
+			}
+			catch (...) {}
+			return HOOK_CAST_CALL(void, Character_UpdateLip)(_this, dt, mtd);
+		}
+
+		void LipSyncController_UpdateLip_hook(void* _this, float dt, void* mtd) {
+			try { LipPatchController(_this, "LipSyncController.UpdateLip"); } catch (...) {}
+			return HOOK_CAST_CALL(void, LipSyncController_UpdateLip)(_this, dt, mtd);
+		}
+
+		HOOK_ORIG_TYPE Character_SetAutoUpdateStop_orig;
+		void Character_SetAutoUpdateStop_hook(void* _this, bool stop, void* mtd) {
+			const bool use = g_lipForceMode ? false : stop;
+			if (g_lipFlagLogs++ < 160) {
+				Log(std::format("[v35] SetAutoUpdateStop ch={} in={} use={} force={} field={}",
+					LipCharaId(_this), stop ? 1 : 0, use ? 1 : 0, g_lipForceMode ? 1 : 0,
+					LipReadBool(_this, "isStopUpdate") ? 1 : 0));
+			}
+			return HOOK_CAST_CALL(void, Character_SetAutoUpdateStop)(_this, use, mtd);
+		}
+
+		HOOK_ORIG_TYPE Character_SetOverwriteFlag_orig;
+		void Character_SetOverwriteFlag_hook(void* _this, bool flag, void* mtd) {
+			const bool use = g_lipForceMode ? true : flag;
+			if (g_lipFlagLogs++ < 160) {
+				Log(std::format("[v35] SetOverwriteFlag ch={} in={} use={} force={} field={}",
+					LipCharaId(_this), flag ? 1 : 0, use ? 1 : 0, g_lipForceMode ? 1 : 0,
+					LipReadBool(_this, "animationOverwrite") ? 1 : 0));
+			}
+			return HOOK_CAST_CALL(void, Character_SetOverwriteFlag)(_this, use, mtd);
+		}
+
+		HOOK_ORIG_TYPE LipSyncController_SetSerious_orig;
+		void LipSyncController_SetSerious_hook(void* _this, bool serious, void* mtd) {
+			const bool use = g_lipForceMode ? true : serious;
+			if (g_lipFlagLogs++ < 160) {
+				Log(std::format("[v35] SetSerious in={} use={} force={} field={}",
+					serious ? 1 : 0, use ? 1 : 0, g_lipForceMode ? 1 : 0,
+					LipReadBool(_this, "isSerious") ? 1 : 0));
+			}
+			return HOOK_CAST_CALL(void, LipSyncController_SetSerious)(_this, use, mtd);
+		}
+
+		HOOK_ORIG_TYPE LipSyncController_SetOverwrite_orig;
+		void LipSyncController_SetOverwrite_hook(void* _this, bool overwrite, void* mtd) {
+			const bool use = g_lipForceMode ? true : overwrite;
+			if (g_lipFlagLogs++ < 160) {
+				Log(std::format("[v35] SetOverwrite in={} use={} force={} field={}",
+					overwrite ? 1 : 0, use ? 1 : 0, g_lipForceMode ? 1 : 0,
+					LipReadBool(_this, "isOverwrite") ? 1 : 0));
+			}
+			return HOOK_CAST_CALL(void, LipSyncController_SetOverwrite)(_this, use, mtd);
+		}
+
+		HOOK_ORIG_TYPE Character_ResetLipSync_orig;
+		void Character_ResetLipSync_hook(void* _this, void* mtd) {
+			if (g_lipFlagLogs++ < 160)
+				Log(std::format("[v35] Character.ResetLipSync ch={} table={}",
+					LipCharaId(_this), ViewDiag::ptr_str(LipTableOf(LipControllerOf(_this)))));
+			return HOOK_CAST_CALL(void, Character_ResetLipSync)(_this, mtd);
+		}
+
+		HOOK_ORIG_TYPE LiveCharacterController_ResetLipSync_orig;
+		void LiveCharacterController_ResetLipSync_hook(void* _this, void* mtd) {
+			if (g_lipFlagLogs++ < 160)
+				Log("[v35] LiveCharacterController.ResetLipSync");
+			return HOOK_CAST_CALL(void, LiveCharacterController_ResetLipSync)(_this, mtd);
+		}
+
+		HOOK_ORIG_TYPE Character_Update_orig;
+		void Character_Update_hook(void* _this, void* mtd) {
+			static int lastMode = -2, n = 0;
+			if (g_lastSoloVocalMode != lastMode) {
+				lastMode = g_lastSoloVocalMode;
+				n = 0;
+			}
+			if (++n <= 10) {
+				Log(std::format("[v35] Character.Update ch={} vmMode={} stop={} recorded={} overwrite={} table={}",
+					LipCharaId(_this), g_lastSoloVocalMode,
+					LipReadBool(_this, "isStopUpdate") ? 1 : 0,
+					LipReadBool(_this, "isRecordedAnimation") ? 1 : 0,
+					LipReadBool(_this, "animationOverwrite") ? 1 : 0,
+					ViewDiag::ptr_str(LipTableOf(LipControllerOf(_this)))));
+			}
+			return HOOK_CAST_CALL(void, Character_Update)(_this, mtd);
+		}
+
+		void InstallLipHook(int& installed) {
+			const std::string mode = ReadLipMode();
+			if (mode != "diag" && mode != "on" && mode != "force") {
+				Log(std::format("[v34] lip hook off (lip.txt='{}')", mode));
+				return;
+			}
+			g_lipForceMode = (mode == "force");
+			const char* assemblies[] = { "PRISM.Legacy.dll", "PRISM.dll" };
+			bool charDone = false, ctrlDone = false;
+			for (const char* a : assemblies) {
+				if (!charDone) {
+					auto k = il2cpp_symbols_logged::get_class(a, "PRISM", "Character");
+					auto mi = k ? il2cpp_class_get_method_from_name(k, "UpdateLip", 1) : nullptr;
+					if (mi && mi->methodPointer) {
+						const char* tn = il2cpp_method_get_param_count(mi) > 0
+							? il2cpp_symbols::il2cpp_method_get_param_type_name(mi, 0) : "?";
+						Log(std::format("[v34] {}.PRISM.Character::UpdateLip({}) @ {}",
+							a, tn ? tn : "?", ViewDiag::ptr_str((void*)mi->methodPointer)));
+						if (HookAt("Character.UpdateLip", (void*)mi->methodPointer,
+							(void*)Character_UpdateLip_hook, Character_UpdateLip_orig)) {
+							++installed;
+							charDone = true;
+						}
+					}
+				}
+				if (!ctrlDone) {
+					auto k = il2cpp_symbols_logged::get_class(a, "PRISM", "LipSyncController");
+					auto mi = k ? il2cpp_class_get_method_from_name(k, "UpdateLip", 1) : nullptr;
+					if (mi && mi->methodPointer) {
+						const char* tn = il2cpp_method_get_param_count(mi) > 0
+							? il2cpp_symbols::il2cpp_method_get_param_type_name(mi, 0) : "?";
+						Log(std::format("[v34] {}.PRISM.LipSyncController::UpdateLip({}) @ {}",
+							a, tn ? tn : "?", ViewDiag::ptr_str((void*)mi->methodPointer)));
+						if (HookAt("LipSyncController.UpdateLip", (void*)mi->methodPointer,
+							(void*)LipSyncController_UpdateLip_hook, LipSyncController_UpdateLip_orig)) {
+							++installed;
+							ctrlDone = true;
+						}
+					}
+				}
+				if (charDone && ctrlDone) break;
+			}
+			int flagHooks = 0;
+			auto addFlagHook = [&](const char* cls, const char* name, int argc,
+				void* detour, HOOK_ORIG_TYPE& orig, const char* label) {
+				auto k = il2cpp_symbols_logged::get_class("PRISM.Legacy.dll", "PRISM", cls);
+				if (!k) { Log(std::format("[v35] class {} not found", cls)); return; }
+				auto mi = il2cpp_class_get_method_from_name(k, name, argc);
+				if (!mi || !mi->methodPointer) {
+					Log(std::format("[v35] {}::{}({}) not found", cls, name, argc));
+					return;
+				}
+				if (HookAt(label, (void*)mi->methodPointer, detour, orig)) {
+					++installed;
+					++flagHooks;
+					Log(std::format("[v35] {}::{}({}) hooked", cls, name, argc));
+				}
+			};
+			addFlagHook("Character", "SetAutoUpdateStop", 1,
+				(void*)Character_SetAutoUpdateStop_hook, Character_SetAutoUpdateStop_orig,
+				"Character.SetAutoUpdateStop");
+			addFlagHook("Character", "SetOverwriteFlag", 1,
+				(void*)Character_SetOverwriteFlag_hook, Character_SetOverwriteFlag_orig,
+				"Character.SetOverwriteFlag");
+			addFlagHook("Character", "ResetLipSync", 0,
+				(void*)Character_ResetLipSync_hook, Character_ResetLipSync_orig,
+				"Character.ResetLipSync");
+			addFlagHook("Character", "Update", 0,
+				(void*)Character_Update_hook, Character_Update_orig,
+				"Character.Update");
+			addFlagHook("LipSyncController", "SetSerious", 1,
+				(void*)LipSyncController_SetSerious_hook, LipSyncController_SetSerious_orig,
+				"LipSyncController.SetSerious");
+			addFlagHook("LipSyncController", "SetOverwrite", 1,
+				(void*)LipSyncController_SetOverwrite_hook, LipSyncController_SetOverwrite_orig,
+				"LipSyncController.SetOverwrite");
+			addFlagHook("LiveCharacterController", "ResetLipSync", 0,
+				(void*)LiveCharacterController_ResetLipSync_hook, LiveCharacterController_ResetLipSync_orig,
+				"LiveCharacterController.ResetLipSync");
+			Log(std::format("[v35] lip flag hooks={} force={} mode={}",
+				flagHooks, g_lipForceMode ? 1 : 0, mode));
+			Log(std::format("[v34] lip update hooks installed: Character={} Controller={} mode={}",
+				charDone ? 1 : 0, ctrlDone ? 1 : 0, mode));
+		}
+
+
+		void Install() {
+			const char* e1 = getenv("SCSP_SOLO_UNLOCK");
+			if (e1 && *e1 == '0') {
+				g_enabled = false;
+				Log("[v24] SCSP_SOLO_UNLOCK=0 -> vocal-separated unlock disabled, nothing installed");
+				return;
+			}
+			const char* e2 = getenv("SCSP_SOLO_ALL");
+			if (e2 && *e2 == '1') g_forceAll = true;
+			const char* e3 = getenv("SCSP_SOLO_ALL_SONGS");
+			if (e3 && *e3 == '1') g_allSongs = true;
+
+			Log(std::format("[v27] installing solo unlock (master-field write + v24 detours): allSongs={} forceAll={} pid={}",
+				g_allSongs ? 1 : 0, g_forceAll ? 1 : 0, GetCurrentProcessId()));
+
+			int installed = 0;
+			installed += HookAt("MusicData.get_IsLimitedVocalSeparatedLocked",
+				MethodAddr("PRISM.Legacy.dll", "PRISM.Live", "MusicData", "get_IsLimitedVocalSeparatedLocked", 0),
+				(void*)SoloLocked_get_hook, SoloLocked_get_orig) ? 1 : 0;
+			installed += HookAt("MusicData.IsLimitedVocalSeparatedLocked",
+				MethodAddr("PRISM.Legacy.dll", "PRISM.Live", "MusicData", "IsLimitedVocalSeparatedLocked", 1),
+				(void*)SoloLocked_arg_hook, SoloLocked_arg_orig) ? 1 : 0;
+			installed += HookAt("MusicData.CheckLimitedVocalSeparatedSatisfy",
+				MethodAddr("PRISM.Legacy.dll", "PRISM.Live", "MusicData", "CheckLimitedVocalSeparatedSatisfy", 1),
+				(void*)SoloSatisfy_music_hook, SoloSatisfy_music_orig) ? 1 : 0;
+			installed += HookAt("MstSong.CheckLimitedVocalSeparatedSatisfy",
+				MethodAddr("PRISM.Definitions.dll", "PRISM.Definitions", "MstSong", "CheckLimitedVocalSeparatedSatisfy", 0),
+				(void*)SoloSatisfy_mst_hook, SoloSatisfy_mst_orig) ? 1 : 0;
+			installed += HookAt("MstSong.get_IsSongPartsSolo",
+				MethodAddr("PRISM.Definitions.dll", "PRISM.Definitions", "MstSong", "get_IsSongPartsSolo", 0),
+				(void*)MstSong_get_IsSongPartsSolo_hook, MstSong_get_IsSongPartsSolo_orig) ? 1 : 0;
+			installed += HookAt("MusicData.GetValidVocalSeparatedMode",
+				MethodAddr("PRISM.Legacy.dll", "PRISM.Live", "MusicData", "GetValidVocalSeparatedMode", 0),
+				(void*)MusicData_GetValidVocalSeparatedMode_hook, MusicData_GetValidVocalSeparatedMode_orig) ? 1 : 0;
+			if (g_forceAll) {
+				installed += HookAt("MusicData.get_IsAllCharacterVocalSeparated",
+					MethodAddr("PRISM.Legacy.dll", "PRISM.Live", "MusicData", "get_IsAllCharacterVocalSeparated", 0),
+					(void*)SoloAllCharas_hook, SoloAllCharas_orig) ? 1 : 0;
+			}
+			InstallLipHook(installed);   // [v29] lip-table fallback (signature-gated)
+			Log(std::format("[v27] {} hook(s) installed", installed));
+		}
+
+		void Tick() {
+			static int tries = 0;
+			static int tableTries = 0;
+			if (!g_installed) {
+				if (++tries < 3) return;   // let the il2cpp domain settle first
+				if (tries > 600) { g_installed = true; return; }
+				if (!il2cpp_symbols_logged::get_class("PRISM.Definitions.dll", "PRISM.Definitions", "MstSong"))
+					return;
+				g_installed = true;
+				try { Install(); }
+				catch (...) { Log("[v24] Install threw"); }
+				try { DumpClassFieldsOnce(); }
+				catch (...) { Log("[v24] DumpClassFieldsOnce threw"); }
+				return;
+			}
+			if (g_tablesDumped && g_songsPatched) return;
+			if (++tableTries > 3600) { g_tablesDumped = true; g_songsPatched = true; return; }
+			if ((tableTries % 60) != 1) return;   // one probe per second, no busy loop
+			if (!g_songsPatched) {
+				try { PatchAllSongs(); }
+				catch (...) { Log("[v26] PatchAllSongs threw"); }
+			}
+			if (!g_tablesDumped) {
+				try { DumpPartsCharactersOnce(); }
+				catch (...) { Log("[v24] DumpPartsCharactersOnce threw"); }
+			}
+		}
+	}
+
+
+
+
+
 	void MainThreadDispatcher_LateUpdate_hook(void* _this, void* method) {
+		if (!g_saveAuditScanComplete) {
+			g_saveAuditScanComplete = true;
+			DumpSaveAuditMethodSignatures();
+		}
 		try {
 			auto it = mainThreadTasks.begin();
 			while (it != mainThreadTasks.end()) {
@@ -2475,10 +5031,80 @@ namespace
 			printf("MainThreadDispatcher Error: %s\n", ex.what());
 		}
 		OverrideAllTransforms();
+		EventDates::TryDumpTable();  // [PATCH] v14 - master dump + one-shot "never ends" date patch
+		RunwayDump::TryDumpMasters();  // [DIAG] v21 - one-shot runway master dump
+		RunwaySceneScan::TickSceneScan();  // [DIAG] v23 - runway scene texture/TMP discovery
+		ViewDiag::Tick();            // [DIAG] v15 - periodic viewMapping dumps
+		SoloUnlock::Tick();          // [PATCH] v24 - unlock every song's 分唱/solo parts
 		return HOOK_CAST_CALL(void, MainThreadDispatcher_LateUpdate)(_this, method);
 	}
 
-#ifdef __OBSOLETE_HOOK__
+	// =====================================================================
+	// [DIAG] v17 - unlock decision tracing.
+	//   Records how many statuses the reply hooks force to isUnlocked_=true
+	//   and lets CostumePartViewModel log what the UI actually sees while
+	//   it builds its parts (incl. the raw status object it holds).  All
+	//   lines go to unlock-diag.txt in the game root.
+	// =====================================================================
+	namespace UnlockDiag {
+		int g_forcedCos = 0, g_forcedHair = 0, g_forcedAcc = 0;
+		int g_trueCos = 0, g_trueHair = 0, g_trueAcc = 0;
+		int g_partCalls = 0, g_partLogs = 0;
+		int g_ctorLogs = 0, g_svcLogs = 0;
+		int g_svcProbe = 0;
+		// [PATCH] v20
+		int g_accCtorLogs = 0, g_decide0Logs = 0, g_decide2Logs = 0, g_footLogs = 0;
+
+		std::string objDesc(void* obj) {
+			if (!obj) return "(null)";
+			try {
+				auto k = il2cpp_symbols::get_class_from_instance(obj);
+				const char* ns = il2cpp_class_get_namespace(k);
+				const char* nm = il2cpp_class_get_name(k);
+				auto f = il2cpp_class_get_field_from_name(k, "isUnlocked_");
+				const bool u = f ? il2cpp_symbols::read_field<bool>(obj, f) : false;
+				return std::format("{}.{}(isUnlocked_={})", ns && *ns ? ns : "?", nm ? nm : "?", u ? 1 : 0);
+			}
+			catch (...) { return "(err)"; }
+		}
+
+		int objId(void* obj) {
+			if (!obj) return 0;
+			try {
+				auto k = il2cpp_symbols::get_class_from_instance(obj);
+				for (const char* name : { "get_MstCostumeId", "get_MstHairstyleId", "get_MstAccessoryId", "get_Id" }) {
+					auto m = il2cpp_class_get_method_from_name(k, name, 0);
+					if (m && m->methodPointer) {
+						return reinterpret_cast<int(*)(void*)>(m->methodPointer)(obj);
+					}
+				}
+			}
+			catch (...) {}
+			return 0;
+		}
+
+		// [DIAG+PATCH] v18 - dump the cached costume service list contents and
+		// force every item's isUnlocked_ to true in place.
+		void DumpAndForceList(void* list, const char* label) {
+			if (!list) { ViewDiag::appendLog("unlock-diag.txt", std::format("cached {} list=null", label)); return; }
+			int total = 0, unlockedBefore = 0;
+			std::string lockedSamples;
+			il2cpp_symbols::iterate_IEnumerable(list, [&](void* item) {
+				total++;
+				auto k = il2cpp_symbols::get_class_from_instance(item);
+				auto f = il2cpp_class_get_field_from_name(k, "isUnlocked_");
+				const bool u = f ? il2cpp_symbols::read_field<bool>(item, f) : false;
+				if (u) { unlockedBefore++; return; }
+				if (lockedSamples.size() < 220 && total < 2000) lockedSamples += std::format(" [{} {}]", objId(item), objDesc(item));
+				if (f) il2cpp_symbols::write_field(item, f, true);
+			});
+			ViewDiag::appendLog("unlock-diag.txt", std::format("cached {} total={} unlockedBefore={} lockedSamples:{}", label, total, unlockedBefore, lockedSamples));
+		}
+	}
+
+	// [PATCH] __OBSOLETE_HOOK__ guard removed - THIS IS THE REAL UNLOCK.
+	// checkAndAddCostume() writes isUnlocked_ = true on every CostumeStatus the client
+	// receives, and the GetCostumeListReply_get_* hooks below feed it the whole list.
 	void checkAndAddCostume(int key, void* value) {
 		static auto CostumeStatus_klass = il2cpp_symbols::get_class("PRISM.Module.Networking.dll",
 			"PRISM.Module.Networking.Stub.Status", "CostumeStatus");
@@ -2488,23 +5114,25 @@ namespace
 			"PRISM.Module.Networking.Stub.Status", "AccessoryStatus");
 		auto value_klass = il2cpp_symbols::get_class_from_instance(value);
 
-#define unlockAndAddToMap(klass, cacheMap) \
+#define unlockAndAddToMap(klass, cacheMap, tag) \
 		static auto klass##_isUnlocked_field = il2cpp_class_get_field_from_name(klass, "isUnlocked_"); \
+		if (il2cpp_symbols::read_field<bool>(value, klass##_isUnlocked_field)) UnlockDiag::g_true##tag++; \
+		else UnlockDiag::g_forced##tag++; \
 		il2cpp_symbols::write_field(value, klass##_isUnlocked_field, true); \
 		cacheMap.emplace(key, value)
 
 		if (value_klass == CostumeStatus_klass) {
 			// wprintf(L"dic_int_ICostumeStatus_add: this: %p, key: %d\n", _this, key);
-			unlockAndAddToMap(CostumeStatus_klass, cacheDressMap);
+			unlockAndAddToMap(CostumeStatus_klass, cacheDressMap, Cos);
 		}
 		else if (value_klass == HairstyleStatus_klass) {
 			if (g_unlock_all_headwear) {
-				unlockAndAddToMap(HairstyleStatus_klass, cacheHairMap);
+				unlockAndAddToMap(HairstyleStatus_klass, cacheHairMap, Hair);
 			}
 		}
 		else if (value_klass == AccessoryStatus_klass) {
 			if (g_unlock_all_headwear) {
-				unlockAndAddToMap(AccessoryStatus_klass, cacheAccessoryMap);
+				unlockAndAddToMap(AccessoryStatus_klass, cacheAccessoryMap, Acc);
 			}
 		}
 	}
@@ -2524,16 +5152,25 @@ namespace
 			if (this_klass == GetCostumeListReply_klass) {
 				void* CostumeStatus_klass = NULL;
 				FieldInfo* mstCostumeId_field;
+				int itemCount = 0;
 
-				Utils::CSListEditor retList(ret);
-				for (auto i : retList) {
-					if (CostumeStatus_klass == NULL) {
-						CostumeStatus_klass = il2cpp_symbols::get_class_from_instance(i);
-						mstCostumeId_field = il2cpp_class_get_field_from_name(CostumeStatus_klass, costumeIdFieldName);
+				if (ret) {
+					Utils::CSListEditor retList(ret);
+					for (auto i : retList) {
+						if (CostumeStatus_klass == NULL) {
+							CostumeStatus_klass = il2cpp_symbols::get_class_from_instance(i);
+							mstCostumeId_field = il2cpp_class_get_field_from_name(CostumeStatus_klass, costumeIdFieldName);
+						}
+						const auto mstCostumeId = il2cpp_symbols::read_field<int>(i, mstCostumeId_field);
+						checkAndAddCostume(mstCostumeId, i);
+						itemCount++;
 					}
-					const auto mstCostumeId = il2cpp_symbols::read_field<int>(i, mstCostumeId_field);
-					checkAndAddCostume(mstCostumeId, i);
 				}
+				ViewDiag::appendLog("unlock-diag.txt", std::format(
+					"reply-list field={} items={} forced(cos/hair/acc)={}/{}/{} alreadyTrue={}/{}/{}",
+					costumeIdFieldName, itemCount,
+					UnlockDiag::g_forcedCos, UnlockDiag::g_forcedHair, UnlockDiag::g_forcedAcc,
+					UnlockDiag::g_trueCos, UnlockDiag::g_trueHair, UnlockDiag::g_trueAcc));
 			}
 		}
 	}
@@ -2559,7 +5196,462 @@ namespace
 		checkCostumeListReply(_this, ret, "mstAccessoryId_");
 		return ret;
 	}
-#endif
+	// [PATCH] #endif removed (matching the #ifdef __OBSOLETE_HOOK__ that was deleted above)
+
+	// [DIAG] v17 - what the costume-change UI sees per part.
+	// [PATCH] v18 - accessory parts (2..7) are forced to Unlocked for display.
+	// (v18's cache-service probe was removed in v19: invoking those service
+	//  methods through raw method pointers crashed the client.)
+	HOOK_ORIG_TYPE CostumePartViewModel_getStatus_orig;
+	int CostumePartViewModel_getStatus_hook(void* _this, bool isUnlocked, void* unlockableIds) {
+		const auto ret = HOOK_CAST_CALL(int, CostumePartViewModel_getStatus)(_this, isUnlocked, unlockableIds);
+		int out_ret = ret;
+		try {
+			static auto part_klass = ViewDiag::find_class_anywhere("PRISM.Adapters.CostumeChange", "CostumePartViewModel");
+			static auto type_field = part_klass ? il2cpp_class_get_field_from_name((Il2CppClass*)part_klass, "CostumePartType") : nullptr;
+			static auto isDefault_field = part_klass ? il2cpp_class_get_field_from_name((Il2CppClass*)part_klass, "IsDefault") : nullptr;
+			static auto raw_field = part_klass ? il2cpp_class_get_field_from_name((Il2CppClass*)part_klass, "rawStatus") : nullptr;
+			static auto master_field = part_klass ? il2cpp_class_get_field_from_name((Il2CppClass*)part_klass, "Master") : nullptr;
+			const int partType = type_field ? il2cpp_symbols::read_field<int>(_this, type_field) : -1;
+			if (ret != 0 && partType >= 2 && partType <= 7) out_ret = 0;
+			const int callNo = UnlockDiag::g_partCalls++;
+			const bool interesting = ret != 0;   // 1=NotDressOrdered 2=Unlockable 3=Locked
+			if (UnlockDiag::g_partLogs < 800 || (interesting && UnlockDiag::g_partLogs < 6000)) {
+				UnlockDiag::g_partLogs++;
+				const bool isDefault = isDefault_field ? il2cpp_symbols::read_field<bool>(_this, isDefault_field) : false;
+				void* raw = raw_field ? il2cpp_symbols::read_field<void*>(_this, raw_field) : nullptr;
+				void* master = master_field ? il2cpp_symbols::read_field<void*>(_this, master_field) : nullptr;
+				ViewDiag::appendLog("unlock-diag.txt", std::format(
+					"part#{} type={} unlockedArg={} status={} forced={} isDefault={} id={} raw={}",
+					callNo, partType, isUnlocked ? 1 : 0, ret, out_ret, isDefault ? 1 : 0,
+					UnlockDiag::objId(master), UnlockDiag::objDesc(raw)));
+			}
+		}
+		catch (...) {}
+		return out_ret;
+	}
+
+	// [DIAG] v18/v19 - the cached-service probe (DumpAndForceList) is currently
+	// NOT called because invoking the service methods crashed the client.
+
+
+	// [DIAG] v17 - fallback probe: the costume part .ctor (5 params) directly.
+	HOOK_ORIG_TYPE CostumePartViewModel_ctor5_orig;
+	void CostumePartViewModel_ctor5_hook(void* _this, void* status, int characterId, int defaultCostumeId, void* unlockableIds, bool isAllDressOrdered) {
+		HOOK_CAST_CALL(void, CostumePartViewModel_ctor5)(_this, status, characterId, defaultCostumeId, unlockableIds, isAllDressOrdered);
+		try {
+			if (UnlockDiag::g_ctorLogs < 40) {
+				UnlockDiag::g_ctorLogs++;
+				const int sid = UnlockDiag::objId(status);
+				void* cached = nullptr;
+				{
+					auto it = cacheDressMap.find(sid);
+					if (it != cacheDressMap.end()) cached = it->second;
+				}
+				ViewDiag::appendLog("unlock-diag.txt", std::format(
+					"ctor5 #{} status={} id={} ptrMatchesCache={} isAllDressOrdered={} charId={} defaultId={}",
+					UnlockDiag::g_ctorLogs, UnlockDiag::objDesc(status), sid,
+					(cached && cached == status) ? 1 : 0, isAllDressOrdered ? 1 : 0, characterId, defaultCostumeId));
+			}
+		}
+		catch (...) {}
+		return;
+	}
+
+	// [PATCH] v20 - accessory parts (CostumePartType 2..7) are constructed from
+	// an accessory status whose isUnlocked flag reads false, so their Status
+	// field starts as Unlockable/Locked and the costume-change footer shows the
+	// "解放" (unlock) button instead of "決定".  We force the field to 0
+	// (Unlocked) right after construction so every reader - icon badges, the
+	// footer button, decide checks - sees the part as unlocked.
+	HOOK_ORIG_TYPE CostumePartViewModel_ctorAcc_orig;
+	void CostumePartViewModel_ctorAcc_hook(void* _this, void* status, void* defaultAccessoryIds, void* unlockableAccessoryIds) {
+		HOOK_CAST_CALL(void, CostumePartViewModel_ctorAcc)(_this, status, defaultAccessoryIds, unlockableAccessoryIds);
+		try {
+			static auto part_klass = ViewDiag::find_class_anywhere("PRISM.Adapters.CostumeChange", "CostumePartViewModel");
+			static auto type_field = part_klass ? il2cpp_class_get_field_from_name((Il2CppClass*)part_klass, "CostumePartType") : nullptr;
+			static auto status_field = part_klass ? il2cpp_class_get_field_from_name((Il2CppClass*)part_klass, "Status") : nullptr;
+			const int partType = type_field ? il2cpp_symbols::read_field<int>(_this, type_field) : -1;
+			const int st = status_field ? il2cpp_symbols::read_field<int>(_this, status_field) : 0;
+			if (status_field && partType >= 2 && partType <= 7 && st != 0) {
+				il2cpp_symbols::write_field(_this, status_field, 0);
+				if (UnlockDiag::g_accCtorLogs < 60) {
+					UnlockDiag::g_accCtorLogs++;
+					ViewDiag::appendLog("unlock-diag.txt", std::format(
+						"ctorAcc #{} type={} status={}->0 id={} raw={}",
+						UnlockDiag::g_accCtorLogs, partType, st,
+						UnlockDiag::objId(status), UnlockDiag::objDesc(status)));
+				}
+			}
+		}
+		catch (...) {}
+		return;
+	}
+
+	// =====================================================================
+	// [PATCH] Master row dump v5 - ZERO I/O in the hot path.
+	//
+	//   v4 wrote one file line per getter call, which produced 182 MB /
+	//   4.2 M lines and made the idol list screen hang forever.  v5 only
+	//   records *distinct* values in memory and dumps the contiguous
+	//   MstProduceIdol row array as raw bytes, once every 64 KB of newly
+	//   discovered range.  Total disk traffic stays around 25 MB and no
+	//   file is ever touched from inside a getter that the UI calls in a
+	//   loop.
+	// =====================================================================
+	namespace MasterDump {
+		std::mutex g_mtx;
+		std::set<std::string> g_seen;        // dedupe key "what:v=N"
+		std::set<int> g_idolIds;             // every distinct MstIdolId
+		std::set<int> g_rowIds;              // every distinct Id
+		void* g_lo = nullptr;                // lowest row address seen
+		void* g_hi = nullptr;                // highest row address seen
+		size_t g_dumped = 0;                 // range already written out
+
+		// Record a distinct value.  Returns true if it is new.
+		bool Note(const char* what, bool isIdolId, int value) {
+			if (value <= 0) return false;
+			std::lock_guard<std::mutex> lk(g_mtx);
+			char key[80];
+			snprintf(key, sizeof(key), "%s:v=%d", what, value);
+			if (!g_seen.insert(key).second) return false;
+			(isIdolId ? g_idolIds : g_rowIds).insert(value);
+			std::ofstream f("master-dump.txt", std::ios::app);
+			if (f.is_open()) f << what << " v=" << value << "\n";
+			return true;
+		}
+
+		// Track the row address.  Returns true when the discovered range
+		// grew by at least 64 KB since the last dump (so DumpRows is due).
+		bool Track(void* row) {
+			if (!row) return false;
+			const uintptr_t r = (uintptr_t)row;
+			std::lock_guard<std::mutex> lk(g_mtx);
+			const uintptr_t lo = (uintptr_t)g_lo;
+			const uintptr_t hi = (uintptr_t)g_hi;
+			if (!g_lo || r < lo) g_lo = row;
+			if (!g_hi || r > hi) g_hi = row;
+			if (!g_lo || !g_hi) return false;
+			const uintptr_t nlo = (uintptr_t)g_lo;
+			const uintptr_t nhi = (uintptr_t)g_hi;
+			if (nhi <= nlo) return false;
+			const size_t span = (size_t)(nhi - nlo);
+			if (span >= g_dumped + (64u << 10)) {
+				g_dumped = span;
+				return true;
+			}
+			return false;
+		}
+
+		// Write the discovered row array as raw bytes (capped at 4 MB).
+		void DumpRows() {
+			void* lo = nullptr;
+			size_t n = 0;
+			{
+				std::lock_guard<std::mutex> lk(g_mtx);
+				if (!g_lo || !g_hi) return;
+				const uintptr_t nlo = (uintptr_t)g_lo;
+				const uintptr_t nhi = (uintptr_t)g_hi;
+				if (nhi <= nlo) return;
+				lo = g_lo;
+				n = (size_t)(nhi - nlo) + 1024;
+				const size_t CAP = 4u << 20;
+				if (n > CAP) n = CAP;
+			}
+			std::ofstream f("master-rows.bin", std::ios::binary | std::ios::trunc);
+			if (f.is_open()) {
+				f.write((const char*)lo, (std::streamsize)n);
+				f.flush();
+			}
+		}
+	}
+
+	// =====================================================================
+	// [PATCH] v6 - targeted master row dump.
+	//
+	//   Adding a produce-idol entry for a collab character (378001 ..) makes
+	//   the client reject the WHOLE reply with ErrorCode[BF65431C], which is
+	//   the client's "this field does not match my own master" check (the
+	//   same code the costume work hit when CostumeType was wrong).
+	//
+	//   So the real values have to come from the master row.  This dumps the
+	//   raw bytes of the MstProduceIdol object for a few MstIdolId values
+	//   whose "group" (the reply's f3.f1 / f22.f2) is known from real server
+	//   data: 101 -> 1, 201 -> 2, 301 -> 3.  Diffing those against 378/379/
+	//   383 shows which field carries the group, and what it is for the
+	//   collab characters.
+	// =====================================================================
+	namespace MasterRowDump {
+		std::mutex g_mtx;
+		std::map<int, int> g_count;
+
+		bool wanted(int idolId) {
+			switch (idolId) {
+			case 101: case 102: case 201: case 202: case 301: case 302:
+			case 378: case 379: case 380: case 381: case 383: case 484:
+				return true;
+			default:
+				return false;
+			}
+		}
+
+		// at most 3 objects per MstIdolId (the variants)
+		bool ShouldDump(int idolId) {
+			if (!wanted(idolId)) return false;
+			std::lock_guard<std::mutex> lk(g_mtx);
+			int& c = g_count[idolId];
+			if (c >= 3) return false;
+			++c;
+			return true;
+		}
+
+		void Dump(void* obj, int idolId) {
+			std::ofstream f("master-rows2.txt", std::ios::app);
+			if (!f.is_open()) return;
+			f << "=== MstIdolId " << idolId << " ptr=" << obj << "\n";
+			const unsigned char* p = (const unsigned char*)obj;
+			for (int i = 0; i < 256; i += 16) {
+				char line[160];
+				int n = snprintf(line, sizeof(line), "  +%03d ", i);
+				char ascii[17];
+				ascii[16] = 0;
+				for (int j = 0; j < 16; ++j) {
+					const unsigned char c = p[i + j];
+					n += snprintf(line + n, sizeof(line) - n, "%02X ", c);
+					ascii[j] = (c >= 32 && c < 127) ? (char)c : '.';
+				}
+				snprintf(line + n, sizeof(line) - n, " %s", ascii);
+				f << line << "\n";
+			}
+			f.flush();
+		}
+	}
+
+	// =====================================================================
+	// [PATCH] v7 - limited-time gate bypass + master field dump.
+	//
+	//   The collab characters (78..89) and their produce idols (378xxx..389xxx)
+	//   are "limited time" (期間限定) content.  The client refuses any reply
+	//   entry that points at them with ErrorCode[BF65431C] because the period
+	//   is over - this is why adding their P cards crashed the character list.
+	//
+	//   The master rows expose IsLimitedTimeUnlock / UnlockPremise /
+	//   DressOrderBeginDate (confirmed in global-metadata.dat).  The old mod
+	//   NOP'ed the check at a fixed RVA (revertgate 0x03DCA0E9) which no longer
+	//   matches, so instead we force the flag OFF on every master row that has
+	//   it - build independent.
+	// =====================================================================
+#define LIMITED_TIME_GATE_HOOK(klass) \
+	HOOK_ORIG_TYPE klass##_get_IsLimitedTimeUnlock_orig; \
+	bool klass##_get_IsLimitedTimeUnlock_hook(void* _this) { \
+		(void)HOOK_CAST_CALL(bool, klass##_get_IsLimitedTimeUnlock)(_this); \
+		return false; \
+	}
+
+	LIMITED_TIME_GATE_HOOK(MstCostume)
+	LIMITED_TIME_GATE_HOOK(MstHairstyle)
+	LIMITED_TIME_GATE_HOOK(MstAccessory)
+	LIMITED_TIME_GATE_HOOK(MstProduceIdol)
+	LIMITED_TIME_GATE_HOOK(MstIdol)
+	LIMITED_TIME_GATE_HOOK(MstCharacterInfo)
+
+	// dump the method names of the interesting master classes (once)
+	void DumpMasterFields() {
+		static const char* kDump[] = { "MstProduceIdol", "MstIdol", "MstCharacterInfo", "MstCostume", "MstAccessory" };
+		std::ofstream f("mst-fields.txt", std::ios::app);
+		if (!f.is_open()) return;
+		for (const char* cn : kDump) {
+			f << "=== " << cn << " methods ===\n";
+			auto k = il2cpp_symbols_logged::get_class("PRISM.Definitions.dll", "PRISM.Definitions", cn);
+			if (!k) { f << "  (class not found)\n"; continue; }
+			void* iter = nullptr;
+			while (auto mi = il2cpp_class_get_methods(k, &iter)) {
+				const char* mn = il2cpp_method_get_name(mi);
+				f << "  " << (mn ? mn : "?") << " /" << il2cpp_method_get_param_count(mi) << "\n";
+			}
+		}
+		// [PATCH] v8 - the networking side (error handling + the reply entry type)
+		struct NetType { const char* dll; const char* ns; const char* cls; };
+		static const NetType kNet[] = {
+			{ "PRISM.Module.Networking.dll", "PRISM.Module.Networking", "ErrorHandler" },
+			{ "PRISM.Module.Networking.dll", "PRISM.Module.Networking.Stub.Status", "ProduceIdolStatus" },
+		};
+		for (const auto& nt : kNet) {
+			f << "=== " << nt.cls << " methods ===\n";
+			auto k = il2cpp_symbols_logged::get_class(nt.dll, nt.ns, nt.cls);
+			if (!k) { f << "  (class not found)\n"; continue; }
+			void* iter = nullptr;
+			while (auto mi = il2cpp_class_get_methods(k, &iter)) {
+				const char* mn = il2cpp_method_get_name(mi);
+				f << "  " << (mn ? mn : "?") << " /" << il2cpp_method_get_param_count(mi) << "\n";
+			}
+		}
+		f.flush();
+	}
+
+	// =====================================================================
+	// [PATCH] v8 - dump the master field VALUES of a few MstProduceIdol rows.
+	//
+	//   Adding a produce-idol entry for a collab character (378001 ..) makes the
+	//   client reject the whole reply (ErrorCode[BF65431C]).  MstProduceIdol has
+	//   no IsLimitedTimeUnlock field, so the check is on one of its real fields.
+	//   Dumping the getters of a working row (301/302, type 3) and of the collab
+	//   rows (378/379/381, whatever type they really are) shows the difference.
+	// =====================================================================
+	namespace MasterFieldDump {
+		std::mutex g_mtx;
+		std::set<int> g_done;
+
+		bool wanted(int idolId) {
+			switch (idolId) {
+			case 202: case 301: case 302: case 378: case 379: case 381: case 484:
+				return true;
+			default:
+				return false;
+			}
+		}
+
+		bool ShouldDump(int idolId) {
+			if (!wanted(idolId)) return false;
+			std::lock_guard<std::mutex> lk(g_mtx);
+			return g_done.insert(idolId).second;
+		}
+
+		void Dump(void* obj, int idolId) {
+			// only real MstProduceIdol instances (compare by class NAME; the
+			// class pointer from get_class() is not the same instance-cache one)
+			auto inst = il2cpp_symbols::get_class_from_instance(obj);
+			if (!inst) return;
+			const char* clsName = il2cpp_class_get_name(inst);
+			if (!clsName || strcmp(clsName, "MstProduceIdol") != 0) return;
+			auto klass = inst;
+
+			std::ofstream f("mst-values.txt", std::ios::app);
+			if (!f.is_open()) return;
+			f << "=== MstIdolId " << idolId << " ===\n";
+
+			static const char* kIntGetters[] = {
+				"get_Id", "get_ProduceIdolType", "get_MstIdolId", "get_InitialStar",
+				"get_InitialVocal", "get_InitialDance", "get_InitialVisual", "get_InitialMental",
+				"get_LimitVocal", "get_LimitDance", "get_LimitVisual", "get_LimitMental",
+				"get_MaxLevelVocal", "get_MaxLevelDance", "get_MaxLevelVisual", "get_MaxLevelMental",
+				"get_Attribute", "get_MstLiveCenterEffectId", "get_MstLiveSkillId",
+				"get_LimitBreakRecipeProductId", "get_EvolutionRecipeGroupId",
+				"get_GashaVoiceMstVoiceResourceId", "get_GashaSeMstVoiceResourceId",
+				"get_SignPositionIndex",
+			};
+			for (const char* gn : kIntGetters) {
+				auto mi = il2cpp_class_get_method_from_name(klass, gn, 0);
+				if (!mi || !mi->methodPointer) { f << "  " << gn << " : (missing)\n"; continue; }
+				const int v = reinterpret_cast<int(*)(void*)>(mi->methodPointer)(obj);
+				f << "  " << gn << " = " << v << "\n";
+			}
+
+			// get_ReleaseDate returns a DateTime (one 8-byte ulong) -> RAX on x64
+			auto rd = il2cpp_class_get_method_from_name(klass, "get_ReleaseDate", 0);
+			if (rd && rd->methodPointer) {
+				const long long v = reinterpret_cast<long long(*)(void*)>(rd->methodPointer)(obj);
+				f << "  get_ReleaseDate(ticks) = " << v << "\n";
+			}
+
+			auto nameM = il2cpp_class_get_method_from_name(klass, "get_Name", 0);
+			if (nameM && nameM->methodPointer) {
+				auto s = reinterpret_cast<Il2CppString * (*)(void*)>(nameM->methodPointer)(obj);
+				if (s) f << "  get_Name = " << utility::conversions::to_utf8string(std::wstring(s->start_char)) << "\n";
+			}
+			f.flush();
+		}
+	}
+
+	// =====================================================================
+	// [PATCH] v9 - capture the client's own error report.
+	//
+	//   Everything points at the client rejecting the reply during its own
+	//   validation (ErrorCode[BF65431C] -> PRISM.Global._systemReset ->
+	//   Limelight SoftReset).  PRISM.Module.Networking.ErrorHandler is the class
+	//   that turns a failure into that error, so hooking it prints the real
+	//   reason (class + ToString + raw bytes of the argument).
+	// =====================================================================
+	HOOK_ORIG_TYPE ErrorHandler_Handle_orig;
+	void* ErrorHandler_Handle_hook(void* _this, void* arg, MethodInfo* method) {
+		try {
+			std::ofstream f("errhandler.txt", std::ios::app);
+			if (f.is_open() && arg) {
+				auto k = il2cpp_symbols::get_class_from_instance(arg);
+				const char* kn = k ? il2cpp_class_get_name(k) : "?";
+				f << "=== ErrorHandler.Handle arg class=" << (kn ? kn : "?") << "\n";
+				if (k) {
+					auto ts = il2cpp_class_get_method_from_name(k, "ToString", 0);
+					if (ts && ts->methodPointer) {
+						auto s = reinterpret_cast<Il2CppString * (*)(void*)>(ts->methodPointer)(arg);
+						if (s) f << "  ToString = " << utility::conversions::to_utf8string(std::wstring(s->start_char)) << "\n";
+					}
+				}
+				const unsigned char* p = (const unsigned char*)arg;
+				for (int i = 0; i < 128; i += 16) {
+					char line[160];
+					int n = snprintf(line, sizeof(line), "  +%03d ", i);
+					char ascii[17];
+					ascii[16] = 0;
+					for (int j = 0; j < 16; ++j) {
+						const unsigned char c = p[i + j];
+						n += snprintf(line + n, sizeof(line) - n, "%02X ", c);
+						ascii[j] = (c >= 32 && c < 127) ? (char)c : '.';
+					}
+					snprintf(line + n, sizeof(line) - n, " %s", ascii);
+					f << line << "\n";
+				}
+				f.flush();
+			}
+		}
+		catch (...) {}
+		return HOOK_CAST_CALL(void*, ErrorHandler_Handle)(_this, arg, method);
+	}
+
+	HOOK_ORIG_TYPE MstProduceIdol_get_Id_orig;
+	int MstProduceIdol_get_Id_hook(void* _this) {
+		int v = HOOK_CAST_CALL(int, MstProduceIdol_get_Id)(_this);
+		if (v > 0) {
+			if (MasterDump::Note("get_Id", false, v) || MasterDump::Track(_this)) {
+				MasterDump::DumpRows();
+			}
+		}
+		return v;
+	}
+
+	HOOK_ORIG_TYPE MstProduceIdol_get_MstIdolId_orig;
+	int MstProduceIdol_get_MstIdolId_hook(void* _this) {
+		int v = HOOK_CAST_CALL(int, MstProduceIdol_get_MstIdolId)(_this);
+		if (v > 0) {
+			// [PATCH] v6 targeted row dump (see MasterRowDump above)
+			if (MasterRowDump::ShouldDump(v)) MasterRowDump::Dump(_this, v);
+			// [PATCH] v8 field values (see MasterFieldDump above)
+			if (MasterFieldDump::ShouldDump(v)) MasterFieldDump::Dump(_this, v);
+			if (MasterDump::Note("get_MstIdolId", true, v) || MasterDump::Track(_this)) {
+				MasterDump::DumpRows();
+			}
+		}
+		return v;
+	}
+
+	HOOK_ORIG_TYPE MstProduceIdol_set_Id_orig;
+	HOOK_ORIG_TYPE MstProduceIdol_set_MstIdolId_orig;
+	void MstProduceIdol_set_Id_hook(void* _this, int value) {
+		HOOK_CAST_CALL(void, MstProduceIdol_set_Id)(_this, value);
+		if (value > 0) {
+			if (MasterDump::Note("set_Id", false, value) || MasterDump::Track(_this)) {
+				MasterDump::DumpRows();
+			}
+		}
+	}
+	void MstProduceIdol_set_MstIdolId_hook(void* _this, int value) {
+		HOOK_CAST_CALL(void, MstProduceIdol_set_MstIdolId)(_this, value);
+		if (value > 0) {
+			if (MasterDump::Note("set_MstIdolId", true, value) || MasterDump::Track(_this)) {
+				MasterDump::DumpRows();
+			}
+		}
+	}
 
 	HOOK_ORIG_TYPE LiveMVUnitConfirmationModel_ctor_orig;
 	void LiveMVUnitConfirmationModel_ctor_hook(void* _this, void* musicData, void* saveData, void* unitListReply, void* costumeService, void* autoCoordinateFlag) {
@@ -2579,7 +5671,17 @@ namespace
 
 	HOOK_ORIG_TYPE RunwayUnitConfirmationModel_ctor_orig;
 	void RunwayUnitConfirmationModel_ctor_hook(void* _this, int eventId, int stageId, void* saveData, void* unitListReply, void* costumeService, void* historyReply) {
+		RunwayDump::g_lastEventId = eventId;   // [DIAG] v22
 		MstCostumeSnapshot::ResetAllRecords();
+		try {
+			if (UnlockDiag::g_svcLogs < 4) {
+				UnlockDiag::g_svcLogs++;
+				ViewDiag::appendLog("unlock-diag.txt", std::format(
+					"runway-model#{} ctor: svcClass={} eventId={} stageId={}",
+					UnlockDiag::g_svcLogs, UnlockDiag::objDesc(costumeService), eventId, stageId));
+			}
+		}
+		catch (...) {}
 		HOOK_CAST_CALL(void, RunwayUnitConfirmationModel_ctor)(_this, eventId, stageId, saveData, unitListReply, costumeService, historyReply);
 		return;
 	}
@@ -3234,16 +6336,49 @@ namespace
 		HOOK_CAST_CALL(void, CostumeChangeViewModel__ctor)(_this, parameter, characterId, settingCostumeSet, isAllDressOrdered, isEnableDressOrderTab, defaultCostumeSet);
 	}
 
+	// [PATCH] v20 - the footer's "決定 / 解放" button is driven by these checks.
+	// With every costume unlocked in the data, the only false results come from
+	// accessory parts whose Status was built as Unlockable/Locked, so we let
+	// the decide button win there (and log what happens for the next round).
 	HOOK_DEF(bool, CostumeChangeViewModel_CanDecide0)(void* _this) {
-		return g_apply_costumes_automatically
-			? false
-			: HOOK_CAST_CALL(bool, CostumeChangeViewModel_CanDecide0)(_this);
+		if (g_apply_costumes_automatically) {
+			return false;
+		}
+		bool ret = HOOK_CAST_CALL(bool, CostumeChangeViewModel_CanDecide0)(_this);
+		if (!ret || UnlockDiag::g_decide0Logs < 60) {
+			if (UnlockDiag::g_decide0Logs < 200) {
+				UnlockDiag::g_decide0Logs++;
+				ViewDiag::appendLog("unlock-diag.txt", std::format("candecide0 ret={}{}", ret ? 1 : 0, ret ? "" : "->1"));
+			}
+		}
+		return true;
 	}
 
 	HOOK_DEF(bool, CostumeChangeViewModel_CanDecide2)(void* _this, int partType, bool isAllDressOrdered) {
-		return g_apply_costumes_automatically
-			? false
-			: HOOK_CAST_CALL(bool, CostumeChangeViewModel_CanDecide2)(_this, partType, isAllDressOrdered);
+		if (g_apply_costumes_automatically) {
+			return false;
+		}
+		bool ret = HOOK_CAST_CALL(bool, CostumeChangeViewModel_CanDecide2)(_this, partType, isAllDressOrdered);
+		const bool accType = partType >= 2 && partType <= 7;
+		if (!ret || (accType && UnlockDiag::g_decide2Logs < 60)) {
+			if (UnlockDiag::g_decide2Logs < 200) {
+				UnlockDiag::g_decide2Logs++;
+				ViewDiag::appendLog("unlock-diag.txt", std::format(
+					"candecide2 type={} allDress={} ret={}{}",
+					partType, isAllDressOrdered ? 1 : 0, ret ? 1 : 0, ret ? "" : "->1"));
+			}
+		}
+		if (!ret && accType) ret = true;
+		return ret;
+	}
+
+	// [DIAG] v20 - which flag the footer actually flips on selection changes.
+	HOOK_DEF(void, CostumeChangeFooterView_SetShowDecide)(void* _this, bool isShow) {
+		if (UnlockDiag::g_footLogs < 300) {
+			UnlockDiag::g_footLogs++;
+			ViewDiag::appendLog("unlock-diag.txt", std::format("footer isShow={}", isShow ? 1 : 0));
+		}
+		HOOK_CAST_CALL(void, CostumeChangeFooterView_SetShowDecide)(_this, isShow);
 	}
 
 	HOOK_DEF(void, CostumeChangeViewModel_RefreshViewModels)(void* _this) {
@@ -3753,6 +6888,41 @@ namespace
 		auto GetCostumeListReply_get_AccessoryList_addr = il2cpp_symbols::get_method_pointer("PRISM.Module.Networking.dll",
 			"PRISM.Module.Networking.Stub.Api", "GetCostumeListReply", "get_AccessoryList", 0);
 
+		// [DIAG] v17
+		auto CostumePartViewModel_getStatus_addr = il2cpp_symbols::get_method_pointer("PRISM.Adapters.dll",
+			"PRISM.Adapters.CostumeChange", "CostumePartViewModel", "_getStatus", 2);
+		auto CostumePartViewModel_ctor5_addr = il2cpp_symbols::get_method_pointer("PRISM.Adapters.dll",
+			"PRISM.Adapters.CostumeChange", "CostumePartViewModel", ".ctor", 5);
+
+		// [PATCH] v20 - find the accessory ctor (IAccessoryStatus, ISet<int>, ISet<int>).
+		// The hairstyle ctor has the same name/arity, so disambiguate by the first
+		// parameter's type name.
+		uintptr_t CostumePartViewModel_ctorAcc_addr = 0;
+		try {
+			auto cpvm_klass = ViewDiag::find_class_anywhere("PRISM.Adapters.CostumeChange", "CostumePartViewModel");
+			if (cpvm_klass) {
+				void* iter = nullptr;
+				while (auto mtd = il2cpp_class_get_methods(cpvm_klass, &iter)) {
+					if (!mtd->methodPointer) continue;
+					const char* nm = il2cpp_method_get_name(mtd);
+					if (!nm || strcmp(nm, ".ctor") != 0) continue;
+					if (il2cpp_method_get_param_count(mtd) != 3) continue;
+					const char* p0n = il2cpp_symbols::il2cpp_method_get_param_type_name(mtd, 0);
+					if (p0n && strstr(p0n, "IAccessoryStatus")) {
+						CostumePartViewModel_ctorAcc_addr = (uintptr_t)mtd->methodPointer;
+						break;
+					}
+				}
+			}
+		}
+		catch (...) {}
+		printf("CostumePartViewModel_ctorAcc found at 0x%p\n", (void*)CostumePartViewModel_ctorAcc_addr);
+
+		// [DIAG] v20 - which flag the footer flips when an accessory is selected.
+		auto CostumeChangeFooterView_SetShowDecide_addr = (uintptr_t)ViewDiag::find_method_anywhere(
+			"PRISM.Interactions.CostumeChange", "CostumeChangeFooterView", "SetShowDecide", 1
+		);
+
 		auto LiveMVUnitConfirmationModel_ctor_addr = il2cpp_symbols::get_method_pointer(
 			"PRISM.Service.dll", "PRISM.Service.Live",
 			"LiveMvUnitConfirmationModel", ".ctor", 5
@@ -3769,7 +6939,7 @@ namespace
 		);
 
 		auto CostumeChangeViewModel_ctor_addr = il2cpp_symbols::get_method_pointer(
-			"PRISM.Adapters", "PRISM.Adapters.CostumeChange",
+			"PRISM.Adapters.dll", "PRISM.Adapters.CostumeChange",
 			"CostumeChangeViewModel", ".ctor", 6
 		);
 
@@ -3885,12 +7055,25 @@ namespace
 		ADD_HOOK_1(SpawnCharacter_CreateCharacter);
 		ADD_HOOK(AssembleCharacter_ApplyParam, "AssembleCharacter_ApplyParam at %p");
 		ADD_HOOK(MainThreadDispatcher_LateUpdate, "MainThreadDispatcher_LateUpdate at %p");
-		//ADD_HOOK(dic_int_ICostumeStatus_add, "dic_int_ICostumeStatus_add at %p");
-		//ADD_HOOK(GetCostumeListReply_get_CostumeList, "GetCostumeListReply_get_CostumeList at %p");
-		//ADD_HOOK(GetCostumeListReply_get_HairstyleList, "GetCostumeListReply_get_HairstyleList at %p");
-		//ADD_HOOK(GetCostumeListReply_get_AccessoryList, "GetCostumeListReply_get_AccessoryList at %p");
+		// [PATCH] enabled - these feed checkAndAddCostume() so every costume the server
+		// sends gets isUnlocked_ = true (the "real" unlock the preview screen shows).
+		ADD_HOOK(dic_int_ICostumeStatus_add, "dic_int_ICostumeStatus_add at %p");
+		ADD_HOOK(GetCostumeListReply_get_CostumeList, "GetCostumeListReply_get_CostumeList at %p");
+		ADD_HOOK(GetCostumeListReply_get_HairstyleList, "GetCostumeListReply_get_HairstyleList at %p");
+		ADD_HOOK(GetCostumeListReply_get_AccessoryList, "GetCostumeListReply_get_AccessoryList at %p");
+		// [DIAG] v17 - trace the part-level unlock decision in the costume-change UI
+		ADD_HOOK(CostumePartViewModel_getStatus, "CostumePartViewModel_getStatus at %p");
+		ADD_HOOK(CostumePartViewModel_ctor5, "CostumePartViewModel_ctor5 at %p");
+		// [PATCH] v20 - accessory parts constructed as Unlocked + footer decide fix.
+		if (CostumePartViewModel_ctorAcc_addr) {
+			ADD_HOOK(CostumePartViewModel_ctorAcc, "CostumePartViewModel_ctorAcc at %p");
+		}
+		if (CostumeChangeFooterView_SetShowDecide_addr) {
+			ADD_HOOK_1(CostumeChangeFooterView_SetShowDecide);
+		}
 		ADD_HOOK(LiveMVUnitConfirmationModel_ctor, "LiveMVUnitConfirmationModel_ctor at %p");
 		ADD_HOOK(RunwayUnitConfirmationModel_ctor, "RunwayUnitConfirmationModel_ctor at %p");
+		ViewDiag::InstallHooks(); // [DIAG] v15 - view connector / viewMapping diagnostics
 		ADD_HOOK(SwayString_SetupPoint, "SwayString_SetupPoint at %p");
 		ADD_HOOK(LiveMVUnit_GetMemberChangeRequestData, "LiveMVUnit_GetMemberChangeRequestData at %p");
 		ADD_HOOK(LiveMVUnitMemberChangePresenter_initializeAsync_b_4_MoveNext, "LiveMVUnitMemberChangePresenter_initializeAsync_b_4_MoveNext at %p");
@@ -3922,6 +7105,99 @@ namespace
 		ADD_HOOK_1(CostumeChangeViewModel_CanDecide0);
 		ADD_HOOK_1(CostumeChangeViewModel_CanDecide2);
 		ADD_HOOK_ADDR(PRISM.Adapters.dll, PRISM.Adapters.CostumeChange, CostumeChangeViewModel, RefreshViewModels, 0);
+		// [PATCH] v7 - limited-time gate bypass (see the hooks above).
+		// Resolve at runtime so a class that has no such getter is harmless.
+#define INSTALL_LIMITED_TIME_GATE(klass) \
+		{ \
+			auto k = il2cpp_symbols_logged::get_class("PRISM.Definitions.dll", "PRISM.Definitions", #klass); \
+			auto m = k ? il2cpp_class_get_method_from_name(k, "get_IsLimitedTimeUnlock", 0) : nullptr; \
+			if (m && m->methodPointer) { \
+				MH_CreateHook((void*)m->methodPointer, (void*)klass##_get_IsLimitedTimeUnlock_hook, &klass##_get_IsLimitedTimeUnlock_orig); \
+				MH_EnableHook((void*)m->methodPointer); \
+				printf("[v7] limited-time gate OFF on %s\n", #klass); \
+			} \
+			else { \
+				printf("[v7] %s has no get_IsLimitedTimeUnlock\n", #klass); \
+			} \
+		}
+		INSTALL_LIMITED_TIME_GATE(MstCostume)
+		INSTALL_LIMITED_TIME_GATE(MstHairstyle)
+		INSTALL_LIMITED_TIME_GATE(MstAccessory)
+		INSTALL_LIMITED_TIME_GATE(MstProduceIdol)
+		INSTALL_LIMITED_TIME_GATE(MstIdol)
+		INSTALL_LIMITED_TIME_GATE(MstCharacterInfo)
+		DumpMasterFields();
+		// [PATCH] v9 - capture the client's error report (see the hook above)
+		ADD_HOOK_ADDR(PRISM.Module.Networking.dll, PRISM.Module.Networking, ErrorHandler, Handle, 1);
+
+		// [PATCH] master row dump for MstProduceIdol (see the hooks above)
+		{
+			std::ofstream f("master-dump.txt", std::ios::app);
+			if (f.is_open()) f << "=== dump patch v7 active ===\n";
+		}
+		ADD_HOOK_ADDR(PRISM.Definitions.dll, PRISM.Definitions, MstProduceIdol, get_Id, 0);
+		ADD_HOOK_ADDR(PRISM.Definitions.dll, PRISM.Definitions, MstProduceIdol, get_MstIdolId, 0);
+		ADD_HOOK_ADDR(PRISM.Definitions.dll, PRISM.Definitions, MstProduceIdol, set_Id, 1);
+		ADD_HOOK_ADDR(PRISM.Definitions.dll, PRISM.Definitions, MstProduceIdol, set_MstIdolId, 1);
+
+		// permanent limited-time events: v14 - one-shot field WRITE on the
+		// newest Shiny Runway row (see EventDates::ApplyPatch).  No hooks:
+		// the four getter hooks were removed in v13 (their addresses are
+		// ICF-shared with unrelated methods - hooking them crashed the game).
+		// This block still installs nothing; it only reports the method
+		// addresses and backing field offsets to runway-diag.txt.  The
+		// applied dates are logged to mst-events-patch.txt.
+		{
+			auto k = il2cpp_symbols_logged::get_class("PRISM.Definitions.dll", "PRISM.Definitions", "MstEvent");
+			std::ofstream d("runway-diag.txt", std::ios::app);
+			if (d.is_open()) {
+				d << "=== v14 EventDates diag (pid " << GetCurrentProcessId() << ") - no hooks, write patch in EventDates ===\n";
+				d << "MstEvent klass=0x" << std::hex << (uintptr_t)k << std::dec;
+				if (k) {
+					const char* kn = il2cpp_class_get_name(k);
+					const char* kns = il2cpp_class_get_namespace(k);
+					d << " name=" << (kn ? kn : "?") << " ns=" << (kns ? kns : "?");
+				}
+				d << "\n";
+			}
+			auto reportOne = [&](const char* name, int argc) {
+				auto m = k ? il2cpp_class_get_method_from_name(k, name, argc) : nullptr;
+				if (!d.is_open()) return;
+				d << name << "(" << argc << ")";
+				if (m) {
+					d << " mi=0x" << std::hex << (uintptr_t)m
+						<< " ptr=0x" << (uintptr_t)m->methodPointer << std::dec;
+					auto rt = il2cpp_method_get_return_type(m);
+					if (rt) {
+						const char* tn = il2cpp_type_get_name(rt);
+						if (tn) d << " ret=" << tn;
+					}
+				}
+				else d << " (not found)";
+				d << "\n";
+			};
+			reportOne("get_Id", 0);
+			reportOne("get_EventType", 0);
+			reportOne("get_BeginDate", 0);
+			reportOne("get_EndDate", 0);
+			reportOne("get_DisplayEndDate", 0);
+			reportOne("set_DisplayEndDate", 1);
+			reportOne("DisplayEndDate", 1);
+			static const char* kBacking[] = {
+				"<Id>k__BackingField", "<EventType>k__BackingField",
+				"<BeginDate>k__BackingField", "<EndDate>k__BackingField",
+				"<DisplayEndDate>k__BackingField" };
+			if (d.is_open() && k) {
+				for (const char* bn : kBacking) {
+					auto fi = il2cpp_symbols_logged::il2cpp_class_get_field_from_name(k, bn);
+					d << "field " << bn << ": ";
+					if (fi) d << "offset=" << fi->offset;
+					else d << "(not found)";
+					d << "\n";
+				}
+				d.flush();
+			}
+		}
 
 		tools::AddNetworkingHooks();
 
