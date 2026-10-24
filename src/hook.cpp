@@ -29,7 +29,7 @@ bool needPrintStack = false;
 std::vector<std::pair<std::pair<int, int>, int>> replaceDressResIds{};
 std::map<std::string, CharaParam_t> charaParam{};
 CharaParam_t baseParam(0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
-std::vector<std::function<bool()>> mainThreadTasks{};  // 返回 true，执行后移除列表；返�?false，执行后不移�?
+std::vector<std::function<bool()>> mainThreadTasks{};  // 返回 true，执行后移除列表；返�?false，执行后不移�?
 
 std::map<int, CharaSwayStringParam_t> charaSwayStringOffset{};
 std::map<int, std::string> swayTypes{
@@ -555,9 +555,9 @@ namespace
 		{
 			replaceFont = il2cpp_gchandle_get_target(ReplaceFontGcHandle);
 
-			// 加载场景时会�?Resources.UnloadUnusedAssets 干掉，且不受 DontDestroyOnLoad 影响，暂且判断是否存活，并在必要的时候重新加�?
-			// TODO: 考虑挂载�?GameObject �?
-			// AssetBundle 不会被干�?
+			// 加载场景时会�?Resources.UnloadUnusedAssets 干掉，且不受 DontDestroyOnLoad 影响，暂且判断是否存活，并在必要的时候重新加�?
+			// TODO: 考虑挂载�?GameObject �?
+			// AssetBundle 不会被干�?
 			if (Object_IsNativeObjectAlive(replaceFont))
 			{
 				return replaceFont;
@@ -592,7 +592,7 @@ namespace
 
 	std::filesystem::path dumpBasePath("dumps");
 
-	// 调用之前检�?DataFile_IsKeyExist
+	// 调用之前检�?DataFile_IsKeyExist
 	void fmtAndDumpJsonBytesData(const std::wstring& dumpName) {
 		const auto dumpNameIl = il2cpp_symbols::NewWStr(dumpName);
 		auto dataBytes = (reinterpret_cast<void* (*)(Il2CppString*)>HOOK_GET_ORIG(DataFile_GetBytes))(dumpNameIl);
@@ -605,7 +605,7 @@ namespace
 			writeWstr.replace(pos, 1, replaceStr);
 			pos = writeWstr.find(searchStr, pos + replaceStr.length());
 		}
-		if (writeWstr.ends_with(L",]")) {  // 代哥�?Json 就是不一�?
+		if (writeWstr.ends_with(L",]")) {  // 代哥�?Json 就是不一�?
 			writeWstr.erase(writeWstr.length() - 2, 1);
 		}
 		const auto dumpLocalFilePath = dumpBasePath / SCLocal::getFilePathByName(dumpName, true, dumpBasePath);
@@ -679,7 +679,7 @@ namespace
 		catch (std::exception& e) {
 			printf("dumpScenarioFromCatalog error: %s\n", e.what());
 		}
-		// 下方方法已过�?
+		// 下方方法已过�?
 		int totalCount = 0;
 		const auto titleData = nlohmann::json::parse(localizationDataCache);
 		for (auto& it : titleData.items()) {
@@ -2845,7 +2845,7 @@ namespace
 	//	HOOK_CAST_CALL(void, PostProcess_DepthOfFieldClip_CreatePlayable)(retstr, _this, graph, go, mtd);
 	//}
 
-	// 已过�?
+	// 已过�?
 	HOOK_ORIG_TYPE Live_SetEnableDepthOfField_orig;
 	void Live_SetEnableDepthOfField_hook(void* _this, bool isEnable) {
 		if (g_enable_free_camera) {
@@ -3013,7 +3013,7 @@ namespace
 	std::map<int, void*> cacheAccessoryMap{};
 
 	HOOK_ORIG_TYPE LiveCostumeChangeModel_ctor_orig;
-	void LiveCostumeChangeModel_ctor_hook(void* _this, void* reply, void* idol, int costumeType, bool forceDressOrdered) {  // 添加服装�?dressDic
+	void LiveCostumeChangeModel_ctor_hook(void* _this, void* reply, void* idol, int costumeType, bool forceDressOrdered) {  // 添加服装�?dressDic
 		/*
 		static auto iidol_klass = il2cpp_symbols::get_class_from_instance(idol);
 		static auto get_CharacterId_mtd = il2cpp_class_get_method_from_name(iidol_klass, "get_CharacterId", 0);
@@ -4411,7 +4411,7 @@ namespace
 		// [v25] the real gate for songs like "Dye the sky." (#37, 037_DyeSky):
 		//   MstSong #37  IsSongParts = true,  IsSongPartsSolo = false
 		// so the 歌唱設定 panel greys out ソロ with
-		//   "この楽曲では対応していません�?
+		//   "この楽曲では対応していません�?
 		// The master row is immutable, so only the *getter* is overridden:
 		// songs that already report IsSongParts=true are told solo is
 		// supported; songs without the part feature keep their value.
@@ -5110,6 +5110,7 @@ namespace
 
 		bool g_liveAutoInstalled = false;
 		void* g_livePresenter = nullptr;
+		void* g_liveButtonsPresenter = nullptr;
 		void* g_liveCarousel = nullptr;
 		void* g_liveVocalVm = nullptr;
 		void* g_liveVocalPresenter = nullptr;
@@ -5220,18 +5221,19 @@ namespace
 		}
 
 		void LiveStart() {
-			if (!g_livePresenter) { LiveAck("start failed: presenter=null"); return; }
+			void* presenter = g_livePresenter ? g_livePresenter : g_liveButtonsPresenter;
+			if (!presenter) { LiveAck("start failed: presenter=null"); return; }
 			try {
 				if (g_liveStart2) {
 					bool a = false, b = false;
-					g_liveStart2->InvokeAsVoid((Il2CppObject*)g_livePresenter,
+					g_liveStart2->InvokeAsVoid((Il2CppObject*)presenter,
 						{ (Il2CppObject*)&a, (Il2CppObject*)&b });
 					LiveAck("start2 invoked");
 					return;
 				}
 				if (g_liveInvoke1) {
 					alignas(16) unsigned char token[32]{};
-					g_liveInvoke1->InvokeAsVoid((Il2CppObject*)g_livePresenter,
+					g_liveInvoke1->InvokeAsVoid((Il2CppObject*)presenter,
 						{ (Il2CppObject*)token });
 					LiveAck("start1 invoked");
 					return;
@@ -5337,6 +5339,20 @@ namespace
 			Log(std::format("[v42] presenter captured {}", ViewDiag::ptr_str(_this)));
 		}
 
+		HOOK_ORIG_TYPE LiveUnitPresenter_ctor_orig;
+		void LiveUnitPresenter_ctor_hook(void* _this, void* a1, void* a2, void* a3, void* mtd) {
+			HOOK_CAST_CALL(void, LiveUnitPresenter_ctor)(_this, a1, a2, a3, mtd);
+			g_livePresenter = _this;
+			Log(std::format("[v47] unit presenter captured {}", ViewDiag::ptr_str(_this)));
+		}
+
+		HOOK_ORIG_TYPE LiveUnitButtons_ctor_orig;
+		void LiveUnitButtons_ctor_hook(void* _this, void* a1, void* a2, void* a3, void* mtd) {
+			HOOK_CAST_CALL(void, LiveUnitButtons_ctor)(_this, a1, a2, a3, mtd);
+			g_liveButtonsPresenter = _this;
+			Log(std::format("[v47] unit buttons presenter captured {}", ViewDiag::ptr_str(_this)));
+		}
+
 		HOOK_ORIG_TYPE LiveMvCarousel_ctor_orig;
 		void LiveMvCarousel_ctor_hook(void* _this, void* a1, void* a2, void* a3, void* a4,
 			void* a5, void* a6, void* a7, void* a8, void* mtd) {
@@ -5400,6 +5416,18 @@ namespace
 				logm("_invokeStartLiveAsync", g_liveInvoke1);
 			}
 			else Log("[v42] LiveMvUnitConfirmationPresenter class not found");
+			auto up = LiveClass("LiveUnitConfirmationPresenter");
+			if (up) {
+				auto ctor = il2cpp_class_get_method_from_name(up, ".ctor", 3);
+				if (ctor && HookAt("LiveUnitConfirmationPresenter.ctor", (void*)ctor->methodPointer, (void*)LiveUnitPresenter_ctor_hook, LiveUnitPresenter_ctor_orig)) ++installed;
+			}
+			auto ub = LiveClass("LiveUnitConfirmationButtonsPresenter");
+			if (ub) {
+				auto ctor = il2cpp_class_get_method_from_name(ub, ".ctor", 3);
+				if (ctor && HookAt("LiveUnitConfirmationButtonsPresenter.ctor", (void*)ctor->methodPointer, (void*)LiveUnitButtons_ctor_hook, LiveUnitButtons_ctor_orig)) ++installed;
+				if (!g_liveStart2) g_liveStart2 = il2cpp_class_get_method_from_name(ub, "_startLiveAsync", 2);
+				if (!g_liveInvoke1) g_liveInvoke1 = il2cpp_class_get_method_from_name(ub, "_invokeStartLiveAsync", 1);
+			}
 			auto ck = LiveClass("LiveMvUnitEditCarouselViewModel");
 			if (ck) {
 				auto ctor = il2cpp_class_get_method_from_name(ck, ".ctor", 8);
