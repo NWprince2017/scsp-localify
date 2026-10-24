@@ -420,6 +420,9 @@ extern float g_font_size_offset;
 extern float g_3d_resolution_scale;
 extern bool g_unlock_PIdol_and_SChara_events;
 extern bool g_unlock_photo_studio;
+// v10: rewrite the client master's MstEvent BeginDate/EndDate so limited-time
+// events (Shiny Runway and friends) stop being "over".  See hook.cpp EventDates.
+extern bool g_extend_event_dates;
 extern int g_start_resolution_w;
 extern int g_start_resolution_h;
 extern bool g_start_resolution_fullScreen;
