@@ -5112,6 +5112,8 @@ namespace
 		void* g_liveVocalPresenter = nullptr;
 		void* g_liveOverlay = nullptr;
 		MethodInfo* g_liveSkipMethod = nullptr;
+		void* g_titlePresenter = nullptr;
+		MethodInfo* g_titleHomeMethod = nullptr;
 		MethodInfo* g_liveStart2 = nullptr;
 		MethodInfo* g_liveInvoke1 = nullptr;
 		std::string g_lastLiveCmd;
@@ -5267,6 +5269,25 @@ namespace
 			catch (...) { LiveAck("skip threw"); }
 		}
 
+		void LiveOpenHome() {
+			if (!g_titlePresenter) { LiveAck("home failed: presenter=null"); return; }
+			if (!g_titleHomeMethod) { LiveAck("home failed: method=null"); return; }
+			try {
+				alignas(16) unsigned char token[32]{};
+				g_titleHomeMethod->InvokeAsVoid((Il2CppObject*)g_titlePresenter,
+					{ (Il2CppObject*)token });
+				LiveAck("home invoked");
+			}
+			catch (...) { LiveAck("home threw"); }
+		}
+
+		HOOK_ORIG_TYPE TitlePresenter_ctor_orig;
+		void TitlePresenter_ctor_hook(void* _this, void* a1, void* a2, void* a3, void* a4, void* a5, void* mtd) {
+			HOOK_CAST_CALL(void, TitlePresenter_ctor)(_this, a1, a2, a3, a4, a5, mtd);
+			g_titlePresenter = _this;
+			Log(std::format("[v43] title presenter captured {}", ViewDiag::ptr_str(_this)));
+		}
+
 		HOOK_ORIG_TYPE LiveOverlay_ctor_orig;
 		void LiveOverlay_ctor_hook(void* _this, void* a1, void* a2, void* a3, void* a4, void* mtd) {
 			HOOK_CAST_CALL(void, LiveOverlay_ctor)(_this, a1, a2, a3, a4, mtd);
@@ -5372,6 +5393,16 @@ namespace
 					(void*)init->methodPointer, (void*)LiveVocalPresenter_Initialize_hook, LiveVocalPresenter_Initialize_orig))
 					++installed;
 			}
+			auto tk = LiveClassNs("PRISM.Adapters.Title", "TitlePresenter");
+			if (tk) {
+				auto ctor = il2cpp_class_get_method_from_name(tk, ".ctor", 5);
+				if (ctor && HookAt("TitlePresenter.ctor",
+					(void*)ctor->methodPointer, (void*)TitlePresenter_ctor_hook, TitlePresenter_ctor_orig))
+					++installed;
+				g_titleHomeMethod = il2cpp_class_get_method_from_name(tk, "_jumpHomeAsync", 1);
+				Log(std::format("[v43] title presenter class found, _jumpHomeAsync={}",
+					g_titleHomeMethod ? ViewDiag::ptr_str((void*)g_titleHomeMethod->methodPointer) : "(null)"));
+			}
 			auto ok = LiveClassNs("PRISM.Adapters.Live", "LiveMVOverlaySequencer");
 			if (ok) {
 				auto ctor = il2cpp_class_get_method_from_name(ok, ".ctor", 4);
@@ -5412,6 +5443,7 @@ namespace
 			else if (verb == "chorus") LiveApply(1, 0);
 			else if (verb == "start") LiveStart();
 			else if (verb == "open") LiveOpenMusic();
+			else if (verb == "home") LiveOpenHome();
 			else if (verb == "skip") LiveSkip();
 			else if (verb == "dump") { LiveDump(); LiveAck("dump"); }
 			else LiveAck("unknown command: " + verb);
