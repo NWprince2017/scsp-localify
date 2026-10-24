@@ -4583,8 +4583,16 @@ namespace
 #ifdef __SAFETYHOOK
 			AddSafetyHook(label, target, detour, orig);
 #else
-			MH_CreateHook(target, detour, &orig);
-			MH_EnableHook(target);
+			MH_STATUS cs = MH_CreateHook(target, detour, &orig);
+			if (cs != MH_OK) {
+				Log(std::format("[hook] {} create failed status={}", label, (int)cs));
+				return false;
+			}
+			MH_STATUS es = MH_EnableHook(target);
+			if (es != MH_OK) {
+				Log(std::format("[hook] {} enable failed status={}", label, (int)es));
+				return false;
+			}
 #endif
 			return true;
 		}
@@ -4624,6 +4632,7 @@ namespace
 		int g_lipHookSubs = 0;
 		int g_lipFlagLogs = 0;
 		bool g_lipForceMode = false;
+		MethodInfo* g_setupLipMethod = nullptr;
 		std::mutex g_lipMutex;
 
 		bool LipReadBool(void* obj, const char* name) {
@@ -4656,6 +4665,28 @@ namespace
 			if (!fi) return nullptr;
 			try { return il2cpp_symbols::read_field<void*>(controller, fi); }
 			catch (...) { return nullptr; }
+		}
+
+		void TryManualSetupLip(void* ch, int cid) {
+			if (!ch || !g_setupLipMethod || !g_setupLipMethod->methodPointer) return;
+			void* table = nullptr;
+			{
+				std::lock_guard<std::mutex> lock(g_lipMutex);
+				if (g_lipCachedHandle) table = il2cpp_gchandle_get_target(g_lipCachedHandle);
+			}
+			if (!table) return;
+			float zero = 0.0f;
+			try {
+				g_setupLipMethod->InvokeAsVoid((Il2CppObject*)ch,
+					{ (Il2CppObject*)table, (Il2CppObject*)&zero, (Il2CppObject*)&zero });
+			}
+			catch (...) {
+				Log(std::format("[v37] manual SetupLip ch={} threw", cid));
+				return;
+			}
+			Log(std::format("[v37] manual SetupLip ch={} table={} controller={} tableAfter={}",
+				cid, ViewDiag::ptr_str(table), ViewDiag::ptr_str(LipControllerOf(ch)),
+				ViewDiag::ptr_str(LipTableOf(LipControllerOf(ch)))));
 		}
 
 		HOOK_ORIG_TYPE Character_SetupLip_orig;
@@ -4837,16 +4868,24 @@ namespace
 			if (_this && g_lastSoloVocalMode == 2 &&
 				patchedThisMode.find((uintptr_t)_this) == patchedThisMode.end()) {
 				auto controller = LipControllerOf(_this);
-				if (controller && LipPatchController(controller, "Character.Update"))
-					patchedThisMode.insert((uintptr_t)_this);
+				if (controller) {
+					LipPatchController(controller, "Character.Update");
+				}
+				else {
+					TryManualSetupLip(_this, LipCharaId(_this));
+					controller = LipControllerOf(_this);
+				}
+				patchedThisMode.insert((uintptr_t)_this);
 			}
 			if (++n <= 10) {
-				Log(std::format("[v35] Character.Update ch={} vmMode={} stop={} recorded={} overwrite={} table={}",
+				auto controller = LipControllerOf(_this);
+				Log(std::format("[v35] Character.Update ch={} vmMode={} stop={} recorded={} overwrite={} controller={} table={}",
 					LipCharaId(_this), g_lastSoloVocalMode,
 					LipReadBool(_this, "isStopUpdate") ? 1 : 0,
 					LipReadBool(_this, "isRecordedAnimation") ? 1 : 0,
 					LipReadBool(_this, "animationOverwrite") ? 1 : 0,
-					ViewDiag::ptr_str(LipTableOf(LipControllerOf(_this)))));
+					ViewDiag::ptr_str(controller),
+					ViewDiag::ptr_str(LipTableOf(controller))));
 			}
 			return HOOK_CAST_CALL(void, Character_Update)(_this, mtd);
 		}
@@ -4859,6 +4898,16 @@ namespace
 			}
 			g_lipForceMode = (mode == "force");
 			const char* assemblies[] = { "PRISM.Legacy.dll", "PRISM.dll" };
+			for (const char* a : assemblies) {
+				auto ck = il2cpp_symbols_logged::get_class(a, "PRISM", "Character");
+				auto sl = ck ? il2cpp_class_get_method_from_name(ck, "SetupLip", 3) : nullptr;
+				if (sl && sl->methodPointer) {
+					g_setupLipMethod = sl;
+					Log(std::format("[v37] cached Character.SetupLip method @ {}",
+						ViewDiag::ptr_str((void*)sl->methodPointer)));
+					break;
+				}
+			}
 			bool charDone = false, ctrlDone = false;
 			for (const char* a : assemblies) {
 				if (!charDone) {
