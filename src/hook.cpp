@@ -4644,6 +4644,14 @@ namespace
 			catch (...) { return false; }
 		}
 
+		void* LipReadPtr(void* obj, const char* name) {
+			if (!obj) return nullptr;
+			auto fi = FieldOf(KlassOf(obj), name);
+			if (!fi) return nullptr;
+			try { return il2cpp_symbols::read_field<void*>(obj, fi); }
+			catch (...) { return nullptr; }
+		}
+
 		int LipCharaId(void* ch) {
 			if (!ch) return -1;
 			auto fi = FieldOf(KlassOf(ch), "<CharacterID>k__BackingField");
@@ -4685,9 +4693,48 @@ namespace
 				Log(std::format("[v37] manual SetupLip ch={} threw", cid));
 				return;
 			}
-			Log(std::format("[v37] manual SetupLip ch={} table={} controller={} tableAfter={}",
-				cid, ViewDiag::ptr_str(table), ViewDiag::ptr_str(LipControllerOf(ch)),
-				ViewDiag::ptr_str(LipTableOf(LipControllerOf(ch)))));
+			void* controller = LipControllerOf(ch);
+			void* faceAnim = LipReadPtr(ch, "_faceAnimator");
+			void* myAnim = LipReadPtr(ch, "_myAnimator");
+			void* lipAnim = LipReadPtr(controller, "_animator");
+			void* lips = LipReadPtr(controller, "_lips");
+			const char* lipsClass = lips ? RunwayDump::ClassNameOf(lips) : nullptr;
+			bool patchedAnimator = false;
+			auto animField = FieldOf(KlassOf(controller), "_animator");
+			if (!lipAnim && animField && (faceAnim || myAnim)) {
+				void* value = faceAnim ? faceAnim : myAnim;
+				il2cpp_field_set_value(controller, animField, &value);
+				lipAnim = value;
+				patchedAnimator = true;
+			}
+			void* table2 = LipTableOf(controller);
+			int lastFrame = -1;
+			void* datas = nullptr;
+			int dataCount = -1;
+			if (table2) {
+				auto tk = KlassOf(table2);
+				auto ff = FieldOf(tk, "lastFrame");
+				if (ff) try { lastFrame = il2cpp_symbols::read_field<int>(table2, ff); } catch (...) {}
+				auto fd = FieldOf(tk, "datas");
+				if (fd) try { datas = il2cpp_symbols::read_field<void*>(table2, fd); } catch (...) {}
+				if (datas) try { dataCount = (int)il2cpp_array_length(datas); } catch (...) {}
+			}
+			Log(std::format("[v40] SetupLip fields ch={} table={} ctrl={} faceAnim={} myAnim={} lipAnim={} patchedAnim={} lips={} lipsClass={} lastFrame={} datas={} dataCount={}",
+				cid, ViewDiag::ptr_str(table2), ViewDiag::ptr_str(controller),
+				ViewDiag::ptr_str(faceAnim), ViewDiag::ptr_str(myAnim), ViewDiag::ptr_str(lipAnim),
+				patchedAnimator ? 1 : 0, ViewDiag::ptr_str(lips), lipsClass ? lipsClass : "?",
+				lastFrame, ViewDiag::ptr_str(datas), dataCount));
+			if (patchedAnimator && g_setupLipMethod) {
+				try {
+					g_setupLipMethod->InvokeAsVoid((Il2CppObject*)ch,
+						{ (Il2CppObject*)table, (Il2CppObject*)&zero, (Il2CppObject*)&zero });
+				}
+				catch (...) {}
+				controller = LipControllerOf(ch);
+				Log(std::format("[v40] SetupLip re-run ch={} ctrl={} animator={} table={}",
+					cid, ViewDiag::ptr_str(controller), ViewDiag::ptr_str(LipReadPtr(controller, "_animator")),
+					ViewDiag::ptr_str(LipTableOf(controller))));
+			}
 		}
 
 		HOOK_ORIG_TYPE Character_SetupLip_orig;
