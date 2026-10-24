@@ -4628,6 +4628,9 @@ namespace
 
 		void* g_lipCachedHandle = nullptr;
 		int g_lipCachedSong = -1;
+		void* g_lipLipsHandle = nullptr;
+		void* g_lipLipsSource = nullptr;
+		int g_lipLipsSong = -1;
 		int g_lipHookCalls = 0;
 		int g_lipHookSubs = 0;
 		int g_lipFlagLogs = 0;
@@ -4787,6 +4790,10 @@ namespace
 			void* table = nullptr;
 			try { table = il2cpp_symbols::read_field<void*>(controller, fi); }
 			catch (...) { table = nullptr; }
+			auto fiLips = FieldOf(k, "_lips");
+			void* lips = nullptr;
+			if (fiLips) try { lips = il2cpp_symbols::read_field<void*>(controller, fiLips); }
+			catch (...) { lips = nullptr; }
 
 			const int call = ++g_lipUpdateCalls;
 			static std::string cachedMode;
@@ -4806,7 +4813,17 @@ namespace
 					g_lipCachedHandle = il2cpp_gchandle_new((Il2CppObject*)table, false);
 					g_lipCachedSong = g_lastSongId;
 				}
-				else if (!table && g_lipCachedHandle && g_lastSongId > 0 &&
+				if (lips && g_lastSoloVocalMode != 2 &&
+					(g_lipLipsSource != lips || g_lipLipsSong != g_lastSongId)) {
+					if (g_lipLipsHandle) il2cpp_gchandle_free(g_lipLipsHandle);
+					g_lipLipsHandle = il2cpp_gchandle_new((Il2CppObject*)lips, false);
+					g_lipLipsSource = lips;
+					g_lipLipsSong = g_lastSongId;
+					Log(std::format("[v41] cached lips song={} lips={} class={}",
+						g_lastSongId, ViewDiag::ptr_str(lips),
+						RunwayDump::ClassNameOf(lips) ? RunwayDump::ClassNameOf(lips) : "?"));
+				}
+				if (!table && g_lipCachedHandle && g_lastSongId > 0 &&
 					g_lipCachedSong == g_lastSongId) {
 					void* cached = il2cpp_gchandle_get_target(g_lipCachedHandle);
 					if (cached && RunwayDump::PlausiblePtr((uintptr_t)cached)) {
@@ -4815,11 +4832,21 @@ namespace
 						patched = true;
 					}
 				}
+				if (!lips && fiLips && g_lipLipsHandle && g_lastSongId > 0 &&
+					g_lipLipsSong == g_lastSongId) {
+					void* cachedLips = il2cpp_gchandle_get_target(g_lipLipsHandle);
+					if (cachedLips && RunwayDump::PlausiblePtr((uintptr_t)cachedLips)) {
+						il2cpp_field_set_value(controller, fiLips, &cachedLips);
+						lips = cachedLips;
+						patched = true;
+					}
+				}
 			}
 			if (call <= 40 || patched) {
-				Log(std::format("[v34] LipUpdate src={} song={} vmMode={} lip={} this={} table={} patched={}",
+				Log(std::format("[v34] LipUpdate src={} song={} vmMode={} lip={} this={} table={} lips={} patched={}",
 					source, g_lastSongId, g_lastSoloVocalMode, mode,
-					ViewDiag::ptr_str(controller), ViewDiag::ptr_str(table), patched ? 1 : 0));
+					ViewDiag::ptr_str(controller), ViewDiag::ptr_str(table),
+					ViewDiag::ptr_str(lips), patched ? 1 : 0));
 			}
 			return patched || table != nullptr;
 		}
@@ -4934,7 +4961,7 @@ namespace
 					setupAttempted.insert((uintptr_t)_this);
 					controller = LipControllerOf(_this);
 				}
-				if (controller && !LipTableOf(controller))
+				if (controller && (!LipTableOf(controller) || !LipReadPtr(controller, "_lips")))
 					LipPatchController(controller, "Character.Update");
 				controller = LipControllerOf(_this);
 			}
