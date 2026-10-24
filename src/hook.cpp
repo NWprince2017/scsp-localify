@@ -4901,9 +4901,23 @@ namespace
 					ViewDiag::ptr_str(LipTableOf(controller))));
 			}
 			HOOK_CAST_CALL(void, Character_Update)(_this, mtd);
-			if (g_lastSoloVocalMode == 2) {
-				controller = LipControllerOf(_this);
-				if (controller && LipTableOf(controller)) ManualUpdateLip(controller, cid);
+		}
+
+		HOOK_ORIG_TYPE Character_LateUpdate_orig;
+		void Character_LateUpdate_hook(void* _this, void* mtd) {
+			static int n = 0, lastMode = -2;
+			if (g_lastSoloVocalMode != lastMode) { lastMode = g_lastSoloVocalMode; n = 0; }
+			HOOK_CAST_CALL(void, Character_LateUpdate)(_this, mtd);
+			if (g_lastSoloVocalMode == 2 && _this) {
+				auto controller = LipControllerOf(_this);
+				if (controller && LipTableOf(controller)) {
+					if (++n <= 10) {
+						Log(std::format("[v39] LateUpdate ch={} controller={} table={}",
+							LipCharaId(_this), ViewDiag::ptr_str(controller),
+							ViewDiag::ptr_str(LipTableOf(controller))));
+					}
+					ManualUpdateLip(controller, LipCharaId(_this));
+				}
 			}
 		}
 
@@ -4988,6 +5002,9 @@ namespace
 			addFlagHook("Character", "Update", 0,
 				(void*)Character_Update_hook, Character_Update_orig,
 				"Character.Update");
+			addFlagHook("Character", "LateUpdate", 0,
+				(void*)Character_LateUpdate_hook, Character_LateUpdate_orig,
+				"Character.LateUpdate");
 			addFlagHook("LipSyncController", "SetSerious", 1,
 				(void*)LipSyncController_SetSerious_hook, LipSyncController_SetSerious_orig,
 				"LipSyncController.SetSerious");
