@@ -28,7 +28,7 @@ bool needPrintStack = false;
 std::vector<std::pair<std::pair<int, int>, int>> replaceDressResIds{};
 std::map<std::string, CharaParam_t> charaParam{};
 CharaParam_t baseParam(0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
-std::vector<std::function<bool()>> mainThreadTasks{};  // 返回 true，执行后移除列表；返�?false，执行后不移�?
+std::vector<std::function<bool()>> mainThreadTasks{};  // 返回 true，执行后移除列表；返�?false，执行后不移�?
 
 std::map<int, CharaSwayStringParam_t> charaSwayStringOffset{};
 std::map<int, std::string> swayTypes{
@@ -554,9 +554,9 @@ namespace
 		{
 			replaceFont = il2cpp_gchandle_get_target(ReplaceFontGcHandle);
 
-			// 加载场景时会�?Resources.UnloadUnusedAssets 干掉，且不受 DontDestroyOnLoad 影响，暂且判断是否存活，并在必要的时候重新加�?
-			// TODO: 考虑挂载�?GameObject �?
-			// AssetBundle 不会被干�?
+			// 加载场景时会�?Resources.UnloadUnusedAssets 干掉，且不受 DontDestroyOnLoad 影响，暂且判断是否存活，并在必要的时候重新加�?
+			// TODO: 考虑挂载�?GameObject �?
+			// AssetBundle 不会被干�?
 			if (Object_IsNativeObjectAlive(replaceFont))
 			{
 				return replaceFont;
@@ -591,7 +591,7 @@ namespace
 
 	std::filesystem::path dumpBasePath("dumps");
 
-	// 调用之前检�?DataFile_IsKeyExist
+	// 调用之前检�?DataFile_IsKeyExist
 	void fmtAndDumpJsonBytesData(const std::wstring& dumpName) {
 		const auto dumpNameIl = il2cpp_symbols::NewWStr(dumpName);
 		auto dataBytes = (reinterpret_cast<void* (*)(Il2CppString*)>HOOK_GET_ORIG(DataFile_GetBytes))(dumpNameIl);
@@ -604,7 +604,7 @@ namespace
 			writeWstr.replace(pos, 1, replaceStr);
 			pos = writeWstr.find(searchStr, pos + replaceStr.length());
 		}
-		if (writeWstr.ends_with(L",]")) {  // 代哥�?Json 就是不一�?
+		if (writeWstr.ends_with(L",]")) {  // 代哥�?Json 就是不一�?
 			writeWstr.erase(writeWstr.length() - 2, 1);
 		}
 		const auto dumpLocalFilePath = dumpBasePath / SCLocal::getFilePathByName(dumpName, true, dumpBasePath);
@@ -678,7 +678,7 @@ namespace
 		catch (std::exception& e) {
 			printf("dumpScenarioFromCatalog error: %s\n", e.what());
 		}
-		// 下方方法已过�?
+		// 下方方法已过�?
 		int totalCount = 0;
 		const auto titleData = nlohmann::json::parse(localizationDataCache);
 		for (auto& it : titleData.items()) {
@@ -2844,7 +2844,7 @@ namespace
 	//	HOOK_CAST_CALL(void, PostProcess_DepthOfFieldClip_CreatePlayable)(retstr, _this, graph, go, mtd);
 	//}
 
-	// 已过�?
+	// 已过�?
 	HOOK_ORIG_TYPE Live_SetEnableDepthOfField_orig;
 	void Live_SetEnableDepthOfField_hook(void* _this, bool isEnable) {
 		if (g_enable_free_camera) {
@@ -3012,7 +3012,7 @@ namespace
 	std::map<int, void*> cacheAccessoryMap{};
 
 	HOOK_ORIG_TYPE LiveCostumeChangeModel_ctor_orig;
-	void LiveCostumeChangeModel_ctor_hook(void* _this, void* reply, void* idol, int costumeType, bool forceDressOrdered) {  // 添加服装�?dressDic
+	void LiveCostumeChangeModel_ctor_hook(void* _this, void* reply, void* idol, int costumeType, bool forceDressOrdered) {  // 添加服装�?dressDic
 		/*
 		static auto iidol_klass = il2cpp_symbols::get_class_from_instance(idol);
 		static auto get_CharacterId_mtd = il2cpp_class_get_method_from_name(iidol_klass, "get_CharacterId", 0);
@@ -4398,7 +4398,7 @@ namespace
 		// [v25] the real gate for songs like "Dye the sky." (#37, 037_DyeSky):
 		//   MstSong #37  IsSongParts = true,  IsSongPartsSolo = false
 		// so the 歌唱設定 panel greys out ソロ with
-		//   "この楽曲では対応していません�?
+		//   "この楽曲では対応していません�?
 		// The master row is immutable, so only the *getter* is overridden:
 		// songs that already report IsSongParts=true are told solo is
 		// supported; songs without the part feature keep their value.
@@ -4699,12 +4699,12 @@ namespace
 		HOOK_ORIG_TYPE LipSyncController_UpdateLip_orig;
 		int g_lipUpdateCalls = 0;
 
-		void LipPatchController(void* controller, const char* source) {
-			if (!controller) return;
+		bool LipPatchController(void* controller, const char* source) {
+			if (!controller) return false;
 			auto k = KlassOf(controller);
-			if (!k) return;
+			if (!k) return false;
 			auto fi = FieldOf(k, "_lipSyncTable");
-			if (!fi) return;
+			if (!fi) return false;
 			void* table = nullptr;
 			try { table = il2cpp_symbols::read_field<void*>(controller, fi); }
 			catch (...) { table = nullptr; }
@@ -4742,6 +4742,7 @@ namespace
 					source, g_lastSongId, g_lastSoloVocalMode, mode,
 					ViewDiag::ptr_str(controller), ViewDiag::ptr_str(table), patched ? 1 : 0));
 			}
+			return patched || table != nullptr;
 		}
 
 		void Character_UpdateLip_hook(void* _this, float dt, void* mtd) {
@@ -4827,9 +4828,17 @@ namespace
 		HOOK_ORIG_TYPE Character_Update_orig;
 		void Character_Update_hook(void* _this, void* mtd) {
 			static int lastMode = -2, n = 0;
+			static std::unordered_set<uintptr_t> patchedThisMode;
 			if (g_lastSoloVocalMode != lastMode) {
 				lastMode = g_lastSoloVocalMode;
 				n = 0;
+				patchedThisMode.clear();
+			}
+			if (_this && g_lastSoloVocalMode == 2 &&
+				patchedThisMode.find((uintptr_t)_this) == patchedThisMode.end()) {
+				auto controller = LipControllerOf(_this);
+				if (controller && LipPatchController(controller, "Character.Update"))
+					patchedThisMode.insert((uintptr_t)_this);
 			}
 			if (++n <= 10) {
 				Log(std::format("[v35] Character.Update ch={} vmMode={} stop={} recorded={} overwrite={} table={}",
