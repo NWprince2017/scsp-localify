@@ -4,6 +4,7 @@
 #include <set>
 #include <mutex>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <Psapi.h>
 #include <intsafe.h>
@@ -5095,6 +5096,224 @@ namespace
 		}
 
 
+		bool g_liveAutoInstalled = false;
+		void* g_livePresenter = nullptr;
+		void* g_liveCarousel = nullptr;
+		void* g_liveVocalVm = nullptr;
+		MethodInfo* g_liveStart2 = nullptr;
+		MethodInfo* g_liveInvoke1 = nullptr;
+		std::string g_lastLiveCmd;
+
+		void* LiveClass(const char* name) {
+			const char* as[] = { "PRISM.Legacy.dll", "PRISM.Adapters.dll", "PRISM.dll" };
+			for (const char* a : as) {
+				try {
+					auto k = il2cpp_symbols_logged::get_class(a, "PRISM.Adapters", name);
+					if (k) return k;
+				}
+				catch (...) {}
+			}
+			return nullptr;
+		}
+
+		bool LiveWriteBool(void* obj, const char* name, bool value) {
+			if (!obj) return false;
+			auto fi = FieldOf(KlassOf(obj), name);
+			if (!fi) return false;
+			try { il2cpp_field_set_value(obj, fi, &value); return true; }
+			catch (...) { return false; }
+		}
+
+		bool LiveWriteInt(void* obj, const char* name, int value) {
+			if (!obj) return false;
+			auto fi = FieldOf(KlassOf(obj), name);
+			if (!fi) return false;
+			try { il2cpp_field_set_value(obj, fi, &value); return true; }
+			catch (...) { return false; }
+		}
+
+		int LiveReadInt(void* obj, const char* name) {
+			if (!obj) return -1;
+			auto fi = FieldOf(KlassOf(obj), name);
+			if (!fi) return -1;
+			try { return il2cpp_symbols::read_field<int>(obj, fi); }
+			catch (...) { return -1; }
+		}
+
+		bool LiveReadBool(void* obj, const char* name) {
+			if (!obj) return false;
+			auto fi = FieldOf(KlassOf(obj), name);
+			if (!fi) return false;
+			try { return il2cpp_symbols::read_field<bool>(obj, fi); }
+			catch (...) { return false; }
+		}
+
+		void LiveAck(const std::string& msg) {
+			FILE* f = fopen("auto-live-ack.txt", "w");
+			if (f) { fprintf(f, "%s\n", msg.c_str()); fclose(f); }
+			Log("[v42] " + msg);
+		}
+
+		void LiveDump() {
+			Log(std::format("[v42] dump presenter={} carousel={} vocal={}",
+				ViewDiag::ptr_str(g_livePresenter), ViewDiag::ptr_str(g_liveCarousel),
+				ViewDiag::ptr_str(g_liveVocalVm)));
+			if (g_liveCarousel) {
+				Log(std::format("[v42] carousel active={} mode={} solo={}",
+					LiveReadBool(g_liveCarousel, "<IsActiveVocalSeparate>k__BackingField") ? 1 : 0,
+					LiveReadInt(g_liveCarousel, "<VocalSeparatedMode>k__BackingField"),
+					LiveReadInt(g_liveCarousel, "<VocalSeparatedSoloIndex>k__BackingField")));
+			}
+			if (g_liveVocalVm) {
+				Log(std::format("[v42] vocal separated={} on={} satisfy={} locked={}",
+					LiveReadBool(g_liveVocalVm, "<IsVocalSeparated>k__BackingField") ? 1 : 0,
+					LiveReadBool(g_liveVocalVm, "<IsOn>k__BackingField") ? 1 : 0,
+					LiveReadBool(g_liveVocalVm, "<IsSatisfy>k__BackingField") ? 1 : 0,
+					LiveReadBool(g_liveVocalVm, "<IsLocked>k__BackingField") ? 1 : 0));
+			}
+		}
+
+		void LiveApply(int mode, int soloIndex) {
+			bool car = false, voc = false;
+			if (g_liveCarousel) {
+				car |= LiveWriteBool(g_liveCarousel, "<IsActiveVocalSeparate>k__BackingField", true);
+				car |= LiveWriteInt(g_liveCarousel, "<VocalSeparatedMode>k__BackingField", mode);
+				car |= LiveWriteInt(g_liveCarousel, "<VocalSeparatedSoloIndex>k__BackingField", soloIndex);
+			}
+			if (g_liveVocalVm) {
+				voc |= LiveWriteBool(g_liveVocalVm, "<IsVocalSeparated>k__BackingField", true);
+				voc |= LiveWriteBool(g_liveVocalVm, "<IsOn>k__BackingField", true);
+				voc |= LiveWriteBool(g_liveVocalVm, "<IsSatisfy>k__BackingField", true);
+				voc |= LiveWriteBool(g_liveVocalVm, "<IsLimited>k__BackingField", false);
+			}
+			LiveAck(std::format("mode={} solo={} carousel={} vocal={}",
+				mode, soloIndex, car ? 1 : 0, voc ? 1 : 0));
+		}
+
+		void LiveStart() {
+			if (!g_livePresenter) { LiveAck("start failed: presenter=null"); return; }
+			try {
+				if (g_liveStart2) {
+					bool a = false, b = false;
+					g_liveStart2->InvokeAsVoid((Il2CppObject*)g_livePresenter,
+						{ (Il2CppObject*)&a, (Il2CppObject*)&b });
+					LiveAck("start2 invoked");
+					return;
+				}
+				if (g_liveInvoke1) {
+					bool a = false;
+					g_liveInvoke1->InvokeAsVoid((Il2CppObject*)g_livePresenter,
+						{ (Il2CppObject*)&a });
+					LiveAck("start1 invoked");
+					return;
+				}
+			}
+			catch (...) { LiveAck("start threw"); return; }
+			LiveAck("start failed: no method");
+		}
+
+		HOOK_ORIG_TYPE LiveMvPresenter_ctor_orig;
+		void LiveMvPresenter_ctor_hook(void* _this, void* a1, void* a2, void* a3, void* mtd) {
+			HOOK_CAST_CALL(void, LiveMvPresenter_ctor)(_this, a1, a2, a3, mtd);
+			g_livePresenter = _this;
+			Log(std::format("[v42] presenter captured {}", ViewDiag::ptr_str(_this)));
+		}
+
+		HOOK_ORIG_TYPE LiveMvCarousel_ctor_orig;
+		void LiveMvCarousel_ctor_hook(void* _this, void* a1, void* a2, void* a3, void* a4,
+			void* a5, void* a6, void* a7, void* a8, void* mtd) {
+			HOOK_CAST_CALL(void, LiveMvCarousel_ctor)(_this, a1, a2, a3, a4, a5, a6, a7, a8, mtd);
+			g_liveCarousel = _this;
+			Log(std::format("[v42] carousel captured {} mode={} solo={}",
+				ViewDiag::ptr_str(_this),
+				LiveReadInt(_this, "<VocalSeparatedMode>k__BackingField"),
+				LiveReadInt(_this, "<VocalSeparatedSoloIndex>k__BackingField")));
+		}
+
+		HOOK_ORIG_TYPE LiveVocalVm_ctor_orig;
+		void LiveVocalVm_ctor_hook(void* _this, void* a1, void* mtd) {
+			HOOK_CAST_CALL(void, LiveVocalVm_ctor)(_this, a1, mtd);
+			g_liveVocalVm = _this;
+			Log(std::format("[v42] vocal vm captured {} separated={} on={}",
+				ViewDiag::ptr_str(_this),
+				LiveReadBool(_this, "<IsVocalSeparated>k__BackingField") ? 1 : 0,
+				LiveReadBool(_this, "<IsOn>k__BackingField") ? 1 : 0));
+		}
+
+		void InstallLiveAutoHooks(int& installed) {
+			if (GetFileAttributesA("auto-live.txt") == INVALID_FILE_ATTRIBUTES) {
+				Log("[v42] live auto off (auto-live.txt missing)");
+				return;
+			}
+			auto pk = LiveClass("LiveMvUnitConfirmationPresenter");
+			if (pk) {
+				auto ctor = il2cpp_class_get_method_from_name(pk, ".ctor", 3);
+				if (ctor && HookAt("LiveMvUnitConfirmationPresenter.ctor",
+					(void*)ctor->methodPointer, (void*)LiveMvPresenter_ctor_hook, LiveMvPresenter_ctor_orig))
+					++installed;
+				g_liveStart2 = il2cpp_class_get_method_from_name(pk, "_startLiveAsync", 2);
+				g_liveInvoke1 = il2cpp_class_get_method_from_name(pk, "_invokeStartLiveAsync", 1);
+				auto logm = [&](const char* n, MethodInfo* m) {
+					if (!m) { Log(std::format("[v42] {} not found", n)); return; }
+					std::string ps;
+					for (uint32_t i = 0; i < il2cpp_method_get_param_count(m); ++i) {
+						const char* t = il2cpp_symbols::il2cpp_method_get_param_type_name(m, i);
+						if (i) ps += ",";
+						ps += t ? t : "?";
+					}
+					Log(std::format("[v42] {} ({}) @ {}", n, ps, ViewDiag::ptr_str((void*)m->methodPointer)));
+				};
+				logm("_startLiveAsync", g_liveStart2);
+				logm("_invokeStartLiveAsync", g_liveInvoke1);
+			}
+			else Log("[v42] LiveMvUnitConfirmationPresenter class not found");
+			auto ck = LiveClass("LiveMvUnitEditCarouselViewModel");
+			if (ck) {
+				auto ctor = il2cpp_class_get_method_from_name(ck, ".ctor", 8);
+				if (ctor && HookAt("LiveMvUnitEditCarouselViewModel.ctor",
+					(void*)ctor->methodPointer, (void*)LiveMvCarousel_ctor_hook, LiveMvCarousel_ctor_orig))
+					++installed;
+			}
+			auto vk = LiveClass("VocalSeparateViewModel");
+			if (vk) {
+				auto ctor = il2cpp_class_get_method_from_name(vk, ".ctor", 1);
+				if (ctor && HookAt("VocalSeparateViewModel.ctor",
+					(void*)ctor->methodPointer, (void*)LiveVocalVm_ctor_hook, LiveVocalVm_ctor_orig))
+					++installed;
+			}
+			g_liveAutoInstalled = true;
+			Log("[v42] live auto hooks installed");
+		}
+
+		void TickLiveAuto() {
+			if (!g_liveAutoInstalled) return;
+			static ULONGLONG last = 0;
+			ULONGLONG now = GetTickCount64();
+			if (now - last < 150) return;
+			last = now;
+			FILE* f = fopen("auto-live.txt", "r");
+			if (!f) return;
+			char buf[128]{};
+			if (!fgets(buf, sizeof(buf), f)) buf[0] = '\0';
+			fclose(f);
+			std::string s = buf;
+			while (!s.empty() && (s.back() == '\r' || s.back() == '\n' || s.back() == ' ' || s.back() == '\t'))
+				s.pop_back();
+			size_t p = s.find_first_not_of(" \t");
+			if (p == std::string::npos) s.clear(); else s = s.substr(p);
+			if (s.empty() || s == g_lastLiveCmd) return;
+			g_lastLiveCmd = s;
+			std::string verb = s, args;
+			auto sp = s.find(' ');
+			if (sp != std::string::npos) { verb = s.substr(0, sp); args = s.substr(sp + 1); }
+			int arg = args.empty() ? -1 : atoi(args.c_str());
+			if (verb == "solo") LiveApply(2, arg >= 0 ? arg : 0);
+			else if (verb == "chorus") LiveApply(1, 0);
+			else if (verb == "start") LiveStart();
+			else if (verb == "dump") { LiveDump(); LiveAck("dump"); }
+			else LiveAck("unknown command: " + verb);
+		}
+
 		void Install() {
 			const char* e1 = getenv("SCSP_SOLO_UNLOCK");
 			if (e1 && *e1 == '0') {
@@ -5135,6 +5354,7 @@ namespace
 					(void*)SoloAllCharas_hook, SoloAllCharas_orig) ? 1 : 0;
 			}
 			InstallLipHook(installed);   // [v29] lip-table fallback (signature-gated)
+			InstallLiveAutoHooks(installed);
 			Log(std::format("[v27] {} hook(s) installed", installed));
 		}
 
@@ -5203,6 +5423,7 @@ namespace
 		RunwaySceneScan::TickSceneScan();  // [DIAG] v23 - runway scene texture/TMP discovery
 		ViewDiag::Tick();            // [DIAG] v15 - periodic viewMapping dumps
 		SoloUnlock::Tick();          // [PATCH] v24 - unlock every song's 分唱/solo parts
+		SoloUnlock::TickLiveAuto();  // [v42] file-driven live start
 		return HOOK_CAST_CALL(void, MainThreadDispatcher_LateUpdate)(_this, method);
 	}
 
