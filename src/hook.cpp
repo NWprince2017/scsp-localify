@@ -3060,6 +3060,9 @@ namespace
 	// the selected character in the *pre-sort* lineup, but the vocal stem /
 	// post-load lineup may use another order.  Log the candidate orders and
 	// optionally write the mapped index back into the LiveMVStartData field.
+	void* g_liveViewManager = nullptr;
+	Il2CppReflectionType* g_liveMusicSelectionType = nullptr;
+
 	namespace SoloUnlock {
 		int ReadSongIdFromMvStage(void* mvStage);
 		std::string ReadMvSceneFromMvStage(void* mvStage);
@@ -3715,8 +3718,11 @@ namespace
 
 		HOOK_ORIG_TYPE ViewManager_JumpView_orig;
 		void ViewManager_JumpView_hook(void* _this, Il2CppReflectionType* viewType, bool withFade, void* param, int stackOperation) {
+			g_liveViewManager = _this;
 			try {
-				appendLog("view-jump-log.txt", timestamp() + " JumpView viewType=" + reflection_type_name(viewType)
+				auto vn = reflection_type_name(viewType);
+				if (vn.find("ILiveMusicSelectionConnector") != std::string::npos) g_liveMusicSelectionType = viewType;
+				appendLog("view-jump-log.txt", timestamp() + " JumpView viewType=" + vn
 					+ " withFade=" + (withFade ? "1" : "0") + " stackOperation=" + std::to_string(stackOperation));
 			}
 			catch (...) {}
@@ -3725,8 +3731,11 @@ namespace
 
 		HOOK_ORIG_TYPE ViewManager_JumpViewAsync_orig;
 		void ViewManager_JumpViewAsync_hook(void* retBuf, void* _this, Il2CppReflectionType* viewType, bool withFade, void* param, int stackOperation) {
+			g_liveViewManager = _this;
 			try {
-				appendLog("view-jump-log.txt", timestamp() + " JumpViewAsync viewType=" + reflection_type_name(viewType)
+				auto vn = reflection_type_name(viewType);
+				if (vn.find("ILiveMusicSelectionConnector") != std::string::npos) g_liveMusicSelectionType = viewType;
+				appendLog("view-jump-log.txt", timestamp() + " JumpViewAsync viewType=" + vn
 					+ " withFade=" + (withFade ? "1" : "0") + " stackOperation=" + std::to_string(stackOperation));
 			}
 			catch (...) {}
@@ -5101,20 +5110,26 @@ namespace
 		void* g_liveCarousel = nullptr;
 		void* g_liveVocalVm = nullptr;
 		void* g_liveVocalPresenter = nullptr;
+		void* g_liveOverlay = nullptr;
+		MethodInfo* g_liveSkipMethod = nullptr;
 		MethodInfo* g_liveStart2 = nullptr;
 		MethodInfo* g_liveInvoke1 = nullptr;
 		std::string g_lastLiveCmd;
 
-		void* LiveClass(const char* name) {
+		void* LiveClassNs(const char* ns, const char* name) {
 			const char* as[] = { "PRISM.Legacy.dll", "PRISM.Adapters.dll", "PRISM.dll" };
 			for (const char* a : as) {
 				try {
-					auto k = il2cpp_symbols_logged::get_class(a, "PRISM.Adapters", name);
+					auto k = il2cpp_symbols_logged::get_class(a, ns, name);
 					if (k) return k;
 				}
 				catch (...) {}
 			}
 			return nullptr;
+		}
+
+		void* LiveClass(const char* name) {
+			return LiveClassNs("PRISM.Adapters", name);
 		}
 
 		bool LiveWriteBool(void* obj, const char* name, bool value) {
@@ -5221,6 +5236,44 @@ namespace
 			LiveAck("start failed: no method");
 		}
 
+		void LiveOpenMusic() {
+			if (!g_liveViewManager) { LiveAck("open failed: viewManager=null"); return; }
+			Il2CppReflectionType* t = g_liveMusicSelectionType;
+			if (!t) {
+				const char* as[] = { "PRISM.Legacy.dll", "PRISM.Adapters.dll", "PRISM.dll" };
+				for (const char* a : as) {
+					try { t = reflection::typeof(a, "PRISM.Adapters", "ILiveMusicSelectionConnector"); }
+					catch (...) { t = nullptr; }
+					if (t) break;
+				}
+			}
+			if (!t) { LiveAck("open failed: type=null"); return; }
+			try {
+				auto fn = reinterpret_cast<void(*)(void*, Il2CppReflectionType*, bool, void*, int)>(
+					ViewDiag::ViewManager_JumpView_orig);
+				fn(g_liveViewManager, t, false, nullptr, 0);
+				LiveAck("open invoked");
+			}
+			catch (...) { LiveAck("open threw"); }
+		}
+
+		void LiveSkip() {
+			if (!g_liveOverlay) { LiveAck("skip failed: overlay=null"); return; }
+			if (!g_liveSkipMethod) { LiveAck("skip failed: method=null"); return; }
+			try {
+				g_liveSkipMethod->InvokeAsVoid((Il2CppObject*)g_liveOverlay, {});
+				LiveAck("skip invoked");
+			}
+			catch (...) { LiveAck("skip threw"); }
+		}
+
+		HOOK_ORIG_TYPE LiveOverlay_ctor_orig;
+		void LiveOverlay_ctor_hook(void* _this, void* a1, void* a2, void* a3, void* a4, void* mtd) {
+			HOOK_CAST_CALL(void, LiveOverlay_ctor)(_this, a1, a2, a3, a4, mtd);
+			g_liveOverlay = _this;
+			Log(std::format("[v43] overlay sequencer captured {}", ViewDiag::ptr_str(_this)));
+		}
+
 		HOOK_ORIG_TYPE LiveMvPresenter_ctor_orig;
 		void LiveMvPresenter_ctor_hook(void* _this, void* a1, void* a2, void* a3, void* mtd) {
 			HOOK_CAST_CALL(void, LiveMvPresenter_ctor)(_this, a1, a2, a3, mtd);
@@ -5319,6 +5372,16 @@ namespace
 					(void*)init->methodPointer, (void*)LiveVocalPresenter_Initialize_hook, LiveVocalPresenter_Initialize_orig))
 					++installed;
 			}
+			auto ok = LiveClassNs("PRISM.Adapters.Live", "LiveMVOverlaySequencer");
+			if (ok) {
+				auto ctor = il2cpp_class_get_method_from_name(ok, ".ctor", 4);
+				if (ctor && HookAt("LiveMVOverlaySequencer.ctor",
+					(void*)ctor->methodPointer, (void*)LiveOverlay_ctor_hook, LiveOverlay_ctor_orig))
+					++installed;
+				g_liveSkipMethod = il2cpp_class_get_method_from_name(ok, "_skip", 0);
+				Log(std::format("[v43] overlay class found, _skip={}",
+					g_liveSkipMethod ? ViewDiag::ptr_str((void*)g_liveSkipMethod->methodPointer) : "(null)"));
+			}
 			g_liveAutoInstalled = true;
 			Log("[v42] live auto hooks installed");
 		}
@@ -5348,6 +5411,8 @@ namespace
 			if (verb == "solo") LiveApply(2, arg >= 0 ? arg : 0);
 			else if (verb == "chorus") LiveApply(1, 0);
 			else if (verb == "start") LiveStart();
+			else if (verb == "open") LiveOpenMusic();
+			else if (verb == "skip") LiveSkip();
 			else if (verb == "dump") { LiveDump(); LiveAck("dump"); }
 			else LiveAck("unknown command: " + verb);
 		}
